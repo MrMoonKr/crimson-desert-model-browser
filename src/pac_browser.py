@@ -39,10 +39,14 @@ from pam_export import (
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QStackedWidget, QWidget,
-    QVBoxLayout, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem,
+    QVBoxLayout, QHBoxLayout, QLineEdit, QListView,
     QPushButton, QLabel, QFileDialog, QMenuBar, QMessageBox, QComboBox,
+    QStyledItemDelegate,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QSize, QTimer,
+    QAbstractListModel, QModelIndex,
+)
 from PySide6.QtGui import QSurfaceFormat, QAction, QFont
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
@@ -151,7 +155,7 @@ QLineEdit {
 QLineEdit:focus {
     border-color: #5b8def;
 }
-QListWidget {
+QListView {
     background-color: #1a1a30;
     color: #c8c8d8;
     border: 1px solid #2a2a42;
@@ -160,15 +164,15 @@ QListWidget {
     font-size: 12px;
     padding: 2px;
 }
-QListWidget::item {
+QListView::item {
     padding: 4px 8px;
     border-radius: 3px;
 }
-QListWidget::item:selected {
+QListView::item:selected {
     background-color: #2e4a7a;
     color: #ffffff;
 }
-QListWidget::item:hover:!selected {
+QListView::item:hover:!selected {
     background-color: #22223a;
 }
 QSplitter::handle {
@@ -283,13 +287,10 @@ QComboBox:hover {
     border-color: #5b8def;
 }
 QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 20px;
     border: none;
-    padding-right: 8px;
-}
-QComboBox::down-arrow {
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 6px solid #7878a0;
 }
 QComboBox QAbstractItemView {
     background-color: #1e1e38;
@@ -305,6 +306,138 @@ QMessageBox QLabel {
     color: #d4d4e0;
 }
 """
+
+
+# ── Fuzzy search ───────────────────────────────────────────────────
+
+def fuzzy_match(query: str, target: str) -> tuple[bool, int]:
+    """Subsequence fuzzy match like VS Code Ctrl+P.
+
+    Returns (matched, score). Higher score = better match.
+    Bonuses for: consecutive chars, match after '_' boundary, match at start.
+    """
+    qi = 0
+    qlen = len(query)
+    if qlen == 0:
+        return True, 0
+
+    score = 0
+    prev_matched = False
+    consecutive = 0
+
+    for ti, ch in enumerate(target):
+        if qi < qlen and ch == query[qi]:
+            qi += 1
+            # Consecutive bonus
+            if prev_matched:
+                consecutive += 1
+                score += consecutive * 3
+            else:
+                consecutive = 1
+            # Boundary bonus: start of string or after '_'
+            if ti == 0 or target[ti - 1] == '_':
+                score += 5
+            score += 1
+            prev_matched = True
+        else:
+            prev_matched = False
+            consecutive = 0
+
+    if qi < qlen:
+        return False, 0
+    return True, score
+
+
+# ── Virtual list model ─────────────────────────────────────────────
+
+_SEPARATOR_SENTINEL = object()  # unique marker for separator rows
+
+
+class CatalogModel(QAbstractListModel):
+    """Virtual list model — Qt only requests data for visible rows.
+
+    Supports an optional separator between exact and fuzzy results.
+    Separator rows store _SEPARATOR_SENTINEL and are non-selectable.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows = []       # list of CatalogEntry | _SEPARATOR_SENTINEL
+        self._show_tags = True
+
+    def set_results(self, exact: list, fuzzy: list, show_tags: bool = True):
+        """Set search results with optional separator between groups."""
+        self.beginResetModel()
+        self._show_tags = show_tags
+        self._rows = list(exact)
+        if exact and fuzzy:
+            self._rows.append(_SEPARATOR_SENTINEL)
+        self._rows.extend(fuzzy)
+        self.endResetModel()
+
+    def set_items(self, items: list, show_tags: bool = True):
+        """Set plain item list (no separator)."""
+        self.beginResetModel()
+        self._show_tags = show_tags
+        self._rows = list(items)
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._rows)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        item = self._rows[index.row()]
+        if item is _SEPARATOR_SENTINEL:
+            if role == Qt.ItemDataRole.DisplayRole:
+                return "\u2500\u2500  closest matches  \u2500\u2500"
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
+            if self._show_tags:
+                tag = "PAC" if item.file_type == "pac" else "PAM"
+                return f"{item.display_name}  [{tag}]"
+            return item.display_name
+        if role == Qt.ItemDataRole.UserRole:
+            return item
+        return None
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        item = self._rows[index.row()]
+        if item is _SEPARATOR_SENTINEL:
+            return Qt.ItemFlag.NoItemFlags  # not selectable
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+
+class SeparatorDelegate(QStyledItemDelegate):
+    """Custom delegate that renders separator rows with a distinct style."""
+
+    def paint(self, painter, option, index):
+        item = index.model()._rows[index.row()] if index.isValid() else None
+        if item is _SEPARATOR_SENTINEL:
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(option.palette.base())
+            painter.drawRect(option.rect)
+            painter.setPen(option.palette.color(option.palette.ColorRole.PlaceholderText))
+            from PySide6.QtGui import QFont as _QFont
+            font = _QFont(option.font)
+            font.setPointSize(font.pointSize() - 1)
+            font.setItalic(True)
+            painter.setFont(font)
+            painter.drawText(option.rect.adjusted(8, 0, 0, 0),
+                             Qt.AlignmentFlag.AlignVCenter, "\u2500  closest matches  \u2500")
+            painter.restore()
+            return
+        super().paint(painter, option, index)
+
+    def sizeHint(self, option, index):
+        item = index.model()._rows[index.row()] if index.isValid() else None
+        if item is _SEPARATOR_SENTINEL:
+            return QSize(option.rect.width(), 24)
+        return super().sizeHint(option, index)
 
 
 # ── Catalog builder ─────────────────────────────────────────────────
@@ -1136,20 +1269,34 @@ class BrowserWindow(QMainWindow):
         self._category_filter = QComboBox()
         self._category_filter.addItems(["All", "Characters", "Objects", "Effects", "Terrain"])
         self._category_filter.setEnabled(False)
-        self._category_filter.currentTextChanged.connect(self._apply_filters)
+        self._category_filter.currentTextChanged.connect(self._on_category_changed)
         layout.addWidget(self._category_filter)
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search models...")
         self._search.setClearButtonEnabled(True)
         self._search.setEnabled(False)
-        self._search.textChanged.connect(self._apply_filters)
+        self._search.textChanged.connect(self._on_search_text_changed)
         layout.addWidget(self._search)
         self._count_label = QLabel("")
         self._count_label.setObjectName("countLabel")
         layout.addWidget(self._count_label)
-        self._list = QListWidget()
-        self._list.currentItemChanged.connect(self._on_selection)
+
+        # Virtual list model — only renders visible rows
+        self._list_model = CatalogModel(self)
+        self._list = QListView()
+        self._list.setModel(self._list_model)
+        self._list.setItemDelegate(SeparatorDelegate(self._list))
+        self._list.clicked.connect(self._on_selection)
         layout.addWidget(self._list)
+
+        # Debounce timer for search input (150ms)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
+        self._search_timer.timeout.connect(self._apply_filters)
+
+        # Cache for category-filtered subset (avoids re-filtering 63K on every keystroke)
+        self._category_subset: list[CatalogEntry] = []
 
         # Right panel (loading screen / viewer + info strip)
         self._right_stack = QStackedWidget()
@@ -1195,8 +1342,9 @@ class BrowserWindow(QMainWindow):
     def _on_catalog_ready(self, catalog, all_entries):
         self._catalog = catalog
         self._all_entries = all_entries
+        self._category_subset = catalog
         self._filtered = catalog
-        self._populate_list(catalog)
+        self._list_model.set_items(catalog, show_tags=True)
         pac_count = sum(1 for e in catalog if e.file_type == "pac")
         pam_count = sum(1 for e in catalog if e.file_type == "pam")
         self._count_label.setText(f"{len(catalog):,} models")
@@ -1211,40 +1359,56 @@ class BrowserWindow(QMainWindow):
         self._loading_label.setText(f"Failed to load catalog:\n{msg}")
         self.statusBar().showMessage(f"Error: {msg}")
 
-    def _apply_filters(self, _=None):
+    def _on_category_changed(self, _=None):
+        """Rebuild category subset and re-apply text filter."""
         category = self._category_filter.currentText().lower()
+        if category == "all":
+            self._category_subset = self._catalog
+        else:
+            self._category_subset = [e for e in self._catalog if e.category == category]
+        self._apply_filters()
+
+    def _on_search_text_changed(self, _=None):
+        """Start debounce timer on text input."""
+        self._search_timer.start()
+
+    def _apply_filters(self):
         key = self._search.text().strip().lower()
+        show_tags = self._category_filter.currentText() == "All"
+        subset = self._category_subset
 
-        filtered = self._catalog
-        if category != "all":
-            filtered = [e for e in filtered if e.category == category]
         if key:
+            exact = []   # substring matches (all search terms present)
+            fuzzy = []   # fuzzy-only matches (subsequence but not substring)
             terms = key.split()
-            filtered = [e for e in filtered if all(t in e.search_key for t in terms)]
+            for e in subset:
+                # Check exact substring match first
+                if all(t in e.search_key for t in terms):
+                    exact.append(e)
+                else:
+                    matched, score = fuzzy_match(key, e.search_key)
+                    if matched:
+                        fuzzy.append((score, e))
+            fuzzy.sort(key=lambda x: -x[0])
+            fuzzy_entries = [e for _, e in fuzzy]
+            self._filtered = exact + fuzzy_entries
+            self._list_model.set_results(exact, fuzzy_entries, show_tags=show_tags)
+            count = len(exact) + len(fuzzy_entries)
+        else:
+            self._filtered = subset
+            self._list_model.set_items(subset, show_tags=show_tags)
+            count = len(subset)
 
-        self._filtered = filtered
-        self._populate_list(filtered)
-        count = len(filtered)
-        self._count_label.setText(f"{count:,} matches" if key or category != "all" else f"{count:,} models")
+        is_filtered = key or self._category_filter.currentText() != "All"
+        self._count_label.setText(f"{count:,} matches" if is_filtered else f"{count:,} models")
         self.statusBar().showMessage(f"{count:,} matches")
 
-    def _populate_list(self, entries):
-        self._list.setUpdatesEnabled(False)
-        self._list.clear()
-        for e in entries:
-            label = e.display_name
-            if self._category_filter.currentText() == "All":
-                tag = "PAC" if e.file_type == "pac" else "PAM"
-                label = f"{e.display_name}  [{tag}]"
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, e)
-            self._list.addItem(item)
-        self._list.setUpdatesEnabled(True)
-
-    def _on_selection(self, current, _prev):
-        if current is None:
+    def _on_selection(self, index):
+        if not index.isValid():
             return
-        entry = current.data(Qt.ItemDataRole.UserRole)
+        entry = self._list_model.data(index, Qt.ItemDataRole.UserRole)
+        if entry is None:
+            return
         self._current_entry = entry
         self._export_action.setEnabled(True)
         self._load_model(entry)
