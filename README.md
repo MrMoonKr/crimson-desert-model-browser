@@ -1,4 +1,6 @@
-# Crimson Desert PAC Browser
+# Crimson Desert Model Browser
+
+### Export models from Crimson Desert to Blender
 
 A desktop tool for browsing, previewing, and exporting 3D models from Crimson Desert game archives.
 
@@ -41,75 +43,55 @@ Reads PAC mesh files directly from the game's PAZ archives, displays them in an 
 
 ## Quick Start
 
-### 1. Clone this repo (with submodules)
 
 ```bash
 git clone --recursive https://github.com/Altair200333/CrimsonDesertPacBrowser.git
 cd CrimsonDesertPacBrowser
 ```
 
-If you already cloned without `--recursive`, pull the submodule manually:
-
-```bash
-git submodule update --init --recursive
-```
-
-### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-This installs PySide6, PyOpenGL, numpy, lz4, and cryptography. See [requirements.txt](requirements.txt) for exact versions.
-
-### 3. Run
+Run it
 
 ```bash
-python pac_browser.py
+python src/pac_browser.py
 ```
 
-On first launch you will be asked to locate your Crimson Desert installation folder. This is saved to `pac_browser.ini` and remembered for next time.
+On first launch select Crimson Desert installation folder.
 
 ---
 
-## Usage
 
 ### GUI Browser
 
 ```bash
-python pac_browser.py
+python src/pac_browser.py
 ```
 
 The left panel shows all PAC models from the game. Type in the search bar to filter by name. Click a model to load it in the 3D viewer.
 
-**Controls:**
+Search the model or select it, then click File -> Export to export as obj file with textures
 
-| Action | Input |
-|--------|-------|
-| Rotate camera | Left-click drag |
-| Pan camera | Middle-click drag |
-| Zoom | Scroll wheel |
-| Export model | Ctrl+E or File > Export Model |
-| Change game folder | File > Change Game Directory |
-
-Export creates a folder with the OBJ file, MTL file, and a `textures/` subfolder containing all referenced DDS textures.
+<p>
+  <img src="screenshots/app_1.jpg" height="300">
+  <img src="screenshots/blend_1.jpg" height="300">
+</p>
 
 ### Command-line Export
 
-For scripting or batch workflows, use `pac_export.py` directly:
+For scripting use `pac_export.py` directly:
 
 ```bash
-# Export a single PAC file
-python pac_export.py path/to/model.pac -o output_folder
-
-# Batch export all matching files from game archives
-python pac_export.py --batch --filter "cd_phw_00_ub" -o output_folder
+python src/pac_export.py path/to/model.pac -o output_folder
 ```
 
 ### Tests
 
 ```bash
-python test_pac.py
+python tests/test_pac.py
 ```
 
 Runs 19 tests that validate geometry parsing against known-good models. Requires access to the game archives.
@@ -129,12 +111,10 @@ The tool reads these directly from PAZ archives using the PAMT file index, decom
 
 ## Known Limitations
 
-- About 2% of models with secondary physics data may show a few stray triangles
+- About 2% of models with secondary physics data may show a few stange intralinked triangles
 - No rigging or bone hierarchy export yet
-- Some DDS textures are streaming-only and not stored in full resolution
-- No write-back or mod creation support yet
+- No write-back (though it is possible and will be added soon)
 
-## Acknowledgments
+## Dependencies
 
-- [lazorr410/crimson-desert-unpacker](https://github.com/lazorr410/crimson-desert-unpacker) -- PAZ archive parser and unpacker
-- [Lathiel/crimson-desert-pam-extractor](https://github.com/Lathiel/crimson-desert-pam-extractor) -- reference for PAM format dequantization
+- [lazorr410/crimson-desert-unpacker](https://github.com/lazorr410/crimson-desert-unpacker) - PAZ archive parser and unpacker

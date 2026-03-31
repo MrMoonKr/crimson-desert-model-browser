@@ -19,10 +19,11 @@ from dataclasses import dataclass
 
 # ── Path setup ──────────────────────────────────────────────────────
 
-TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
-UNPACKER_DIR = os.path.join(TOOLS_DIR, "lazorr410-unpacker", "python")
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SRC_DIR)
+UNPACKER_DIR = os.path.join(ROOT_DIR, "lazorr410-unpacker", "python")
 sys.path.insert(0, UNPACKER_DIR)
-sys.path.insert(0, TOOLS_DIR)
+sys.path.insert(0, SRC_DIR)
 
 from paz_parse import parse_pamt, PazEntry
 from paz_crypto import decrypt as paz_decrypt, lz4_decompress
@@ -44,7 +45,7 @@ from OpenGL.GL import *
 
 # ── Settings ────────────────────────────────────────────────────────
 
-INI_PATH = os.path.join(TOOLS_DIR, "pac_browser.ini")
+INI_PATH = os.path.join(ROOT_DIR, "pac_browser.ini")
 
 
 def load_settings() -> dict:

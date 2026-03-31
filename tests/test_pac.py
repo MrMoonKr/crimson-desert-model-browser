@@ -7,18 +7,25 @@ Validates geometry parsing against known-good models. Run with:
 import sys
 import os
 import struct
+import configparser
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                'lazorr410-unpacker', 'python'))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT_DIR, 'src'))
+sys.path.insert(0, os.path.join(ROOT_DIR, 'lazorr410-unpacker', 'python'))
 
 from paz_parse import parse_pamt
 from pac_export import (parse_header, find_mesh_descriptors, decode_vertices,
                         decode_indices, _find_section_layout, decompress_type1_pac)
 from pac_browser import load_pac_mesh, read_pac_bytes
 
-GAME_DIR = r"F:\programs\steam\steamapps\common\Crimson Desert"
+INI_PATH = os.path.join(ROOT_DIR, "pac_browser.ini")
+cfg = configparser.ConfigParser()
+cfg.read(INI_PATH)
+GAME_DIR = cfg.get("pac_browser", "game_dir", fallback="")
+if not GAME_DIR or not os.path.isdir(GAME_DIR):
+    print("Error: game_dir not set. Run pac_browser.py first to configure it.")
+    sys.exit(1)
 DIR_0009 = os.path.join(GAME_DIR, "0009")
 
 passed = 0
