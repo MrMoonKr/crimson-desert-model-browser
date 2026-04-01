@@ -1644,7 +1644,7 @@ class BrowserWindow(QMainWindow):
                         # shorter names rank higher (more specific match)
                         scored.append((len(rec.display_name), rec))
                 scored.sort(key=lambda x: x[0])
-                for _, rec in scored[:20]:
+                for _, rec in scored:
                     item_rows.append(_ItemHeaderRow(
                         display_name=rec.display_name,
                         internal_name=rec.internal_name,
