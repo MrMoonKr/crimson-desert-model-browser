@@ -348,6 +348,61 @@ def fuzzy_match(query: str, target: str) -> tuple[bool, int]:
     return True, score
 
 
+class TrigramIndex:
+    """Trigram inverted index for fast substring search over a fixed set of strings.
+
+    Build once, then query with intersect_entries(term) to get all entries
+    whose search_key contains that term as a substring. For terms shorter
+    than 3 chars, falls back to linear scan of a smaller candidate set.
+    """
+
+    def __init__(self, entries: list):
+        self._entries = entries
+        self._index: dict[str, set[int]] = {}
+        for i, e in enumerate(entries):
+            key = e.search_key
+            for j in range(len(key) - 2):
+                tri = key[j:j+3]
+                if tri not in self._index:
+                    self._index[tri] = set()
+                self._index[tri].add(i)
+
+    def substring_matches(self, term: str) -> list:
+        """Return entries whose search_key contains term as a substring."""
+        if len(term) < 3:
+            # Fallback: linear scan (but still fast — short terms are rare as sole query)
+            return [e for e in self._entries if term in e.search_key]
+
+        # Intersect posting lists for all trigrams in the term
+        trigrams = [term[j:j+3] for j in range(len(term) - 2)]
+        # Start with smallest posting list for efficiency
+        sets = [self._index.get(tri) for tri in trigrams]
+        if any(s is None for s in sets):
+            return []
+        sets.sort(key=len)
+        candidates = sets[0]
+        for s in sets[1:]:
+            candidates = candidates & s
+            if not candidates:
+                return []
+
+        # Verify actual substring match (trigram intersection can have false positives)
+        return [self._entries[i] for i in candidates if term in self._entries[i].search_key]
+
+    def multi_term_matches(self, terms: list[str]) -> list:
+        """Return entries matching ALL terms as substrings."""
+        if not terms:
+            return list(self._entries)
+        # Start with the longest term (most selective)
+        sorted_terms = sorted(terms, key=len, reverse=True)
+        result = self.substring_matches(sorted_terms[0])
+        for term in sorted_terms[1:]:
+            result = [e for e in result if term in e.search_key]
+            if not result:
+                return []
+        return result
+
+
 # ── Virtual list model ─────────────────────────────────────────────
 
 _SEPARATOR_SENTINEL = object()  # unique marker for separator rows
@@ -362,25 +417,43 @@ class CatalogModel(QAbstractListModel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._rows = []       # list of CatalogEntry | _SEPARATOR_SENTINEL
+        self._all_rows = []   # full result set
+        self._rows = []       # currently visible subset (lazy-loaded pages)
         self._show_tags = True
+
+    _PAGE_SIZE = 500  # rows loaded per page
 
     def set_results(self, exact: list, fuzzy: list, show_tags: bool = True):
         """Set search results with optional separator between groups."""
         self.beginResetModel()
         self._show_tags = show_tags
-        self._rows = list(exact)
+        self._all_rows = list(exact)
         if exact and fuzzy:
-            self._rows.append(_SEPARATOR_SENTINEL)
-        self._rows.extend(fuzzy)
+            self._all_rows.append(_SEPARATOR_SENTINEL)
+        self._all_rows.extend(fuzzy)
+        self._rows = self._all_rows[:self._PAGE_SIZE]
         self.endResetModel()
 
     def set_items(self, items: list, show_tags: bool = True):
         """Set plain item list (no separator)."""
         self.beginResetModel()
         self._show_tags = show_tags
-        self._rows = list(items)
+        self._all_rows = list(items)
+        self._rows = self._all_rows[:self._PAGE_SIZE]
         self.endResetModel()
+
+    def can_load_more(self) -> bool:
+        return len(self._rows) < len(self._all_rows)
+
+    def load_more(self):
+        """Append next page of rows."""
+        if not self.can_load_more():
+            return
+        cur = len(self._rows)
+        nxt = min(cur + self._PAGE_SIZE, len(self._all_rows))
+        self.beginInsertRows(QModelIndex(), cur, nxt - 1)
+        self._rows = self._all_rows[:nxt]
+        self.endInsertRows()
 
     def rowCount(self, parent=QModelIndex()):
         return len(self._rows)
@@ -742,7 +815,7 @@ def export_model_with_textures(entry: PazEntry, output_dir: str,
         if desc.material_name == "(null)":
             continue
         base = material_to_dds_basename(desc.material_name)
-        for suffix in ['', '_n', '_sp', '_m', '_mg']:
+        for suffix in ['', '_n', '_sp', '_m', '_mg', '_ma', '_disp', '_o']:
             dds_wanted.add(base + suffix + '.dds')
 
     if cached_entries is not None:
@@ -1234,6 +1307,7 @@ class BrowserWindow(QMainWindow):
         self._catalog: list[CatalogEntry] = []
         self._all_entries: list[PazEntry] = []  # cached PAMT for fast texture export
         self._filtered: list[CatalogEntry] = []
+        self._trigram_index: TrigramIndex | None = None
         self._load_worker: LoadWorker | None = None
         self._export_worker: ExportWorker | None = None
         self._current_entry: CatalogEntry | None = None
@@ -1284,15 +1358,17 @@ class BrowserWindow(QMainWindow):
         # Virtual list model — only renders visible rows
         self._list_model = CatalogModel(self)
         self._list = QListView()
+        self._list.setUniformItemSizes(True)
         self._list.setModel(self._list_model)
         self._list.setItemDelegate(SeparatorDelegate(self._list))
         self._list.clicked.connect(self._on_selection)
+        self._list.verticalScrollBar().valueChanged.connect(self._on_scroll)
         layout.addWidget(self._list)
 
         # Debounce timer for search input (150ms)
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(150)
+        self._search_timer.setInterval(30)
         self._search_timer.timeout.connect(self._apply_filters)
 
         # Cache for category-filtered subset (avoids re-filtering 63K on every keystroke)
@@ -1343,6 +1419,7 @@ class BrowserWindow(QMainWindow):
         self._catalog = catalog
         self._all_entries = all_entries
         self._category_subset = catalog
+        self._trigram_index = TrigramIndex(catalog)
         self._filtered = catalog
         self._list_model.set_items(catalog, show_tags=True)
         pac_count = sum(1 for e in catalog if e.file_type == "pac")
@@ -1360,48 +1437,81 @@ class BrowserWindow(QMainWindow):
         self.statusBar().showMessage(f"Error: {msg}")
 
     def _on_category_changed(self, _=None):
-        """Rebuild category subset and re-apply text filter."""
+        """Rebuild category subset, trigram index, and re-apply text filter."""
         category = self._category_filter.currentText().lower()
         if category == "all":
             self._category_subset = self._catalog
         else:
             self._category_subset = [e for e in self._catalog if e.category == category]
+        self._trigram_index = TrigramIndex(self._category_subset)
         self._apply_filters()
 
     def _on_search_text_changed(self, _=None):
-        """Start debounce timer on text input."""
-        self._search_timer.start()
+        """Filter immediately — trigram index makes this fast enough."""
+        self._apply_filters()
 
     def _apply_filters(self):
         key = self._search.text().strip().lower()
         show_tags = self._category_filter.currentText() == "All"
         subset = self._category_subset
+        idx = self._trigram_index
 
         if key:
-            exact = []   # substring matches (all search terms present)
-            fuzzy = []   # fuzzy-only matches (subsequence but not substring)
             terms = key.split()
-            for e in subset:
-                # Check exact substring match first
-                if all(t in e.search_key for t in terms):
-                    exact.append(e)
-                else:
-                    matched, score = fuzzy_match(key, e.search_key)
-                    if matched:
-                        fuzzy.append((score, e))
-            fuzzy.sort(key=lambda x: -x[0])
-            fuzzy_entries = [e for _, e in fuzzy]
+            # Fast substring matching via trigram index
+            exact = idx.multi_term_matches(terms) if idx else [
+                e for e in subset if all(t in e.search_key for t in terms)]
+
+            # Fuzzy only when exact results are few
+            fuzzy_entries = []
+            if len(exact) < 200:
+                exact_set = set(id(e) for e in exact)
+                fuzzy = []
+                for e in subset:
+                    if id(e) not in exact_set:
+                        matched, score = fuzzy_match(key, e.search_key)
+                        if matched:
+                            fuzzy.append((score, e))
+                fuzzy.sort(key=lambda x: -x[0])
+                fuzzy_entries = [e for _, e in fuzzy]
+
+            count = len(exact) + len(fuzzy_entries)
             self._filtered = exact + fuzzy_entries
             self._list_model.set_results(exact, fuzzy_entries, show_tags=show_tags)
-            count = len(exact) + len(fuzzy_entries)
         else:
             self._filtered = subset
-            self._list_model.set_items(subset, show_tags=show_tags)
             count = len(subset)
+            self._list_model.set_items(subset, show_tags=show_tags)
 
+        displayed = self._list_model.rowCount()
         is_filtered = key or self._category_filter.currentText() != "All"
-        self._count_label.setText(f"{count:,} matches" if is_filtered else f"{count:,} models")
-        self.statusBar().showMessage(f"{count:,} matches")
+        if is_filtered:
+            if displayed < count:
+                label = f"{count:,} matches (showing {displayed:,})"
+            else:
+                label = f"{count:,} matches"
+        else:
+            if displayed < count:
+                label = f"{count:,} models (showing {displayed:,})"
+            else:
+                label = f"{count:,} models"
+        self._count_label.setText(label)
+        self.statusBar().showMessage(label)
+
+    def _on_scroll(self, value):
+        """Load more rows when scrollbar nears bottom."""
+        sb = self._list.verticalScrollBar()
+        if sb.maximum() > 0 and value >= sb.maximum() - 50:
+            if self._list_model.can_load_more():
+                self._list_model.load_more()
+                # Update count label
+                count = len(self._filtered)
+                displayed = self._list_model.rowCount()
+                if displayed < count:
+                    label = f"{count:,} matches (showing {displayed:,})"
+                else:
+                    label = f"{count:,} matches"
+                self._count_label.setText(label)
 
     def _on_selection(self, index):
         if not index.isValid():
@@ -1441,9 +1551,11 @@ class BrowserWindow(QMainWindow):
     def _on_export(self):
         if not self._current_entry:
             return
-        output_dir = QFileDialog.getExistingDirectory(self, "Export to folder")
+        last_dir = load_settings().get("export_dir", "")
+        output_dir = QFileDialog.getExistingDirectory(self, "Export to folder", last_dir)
         if not output_dir:
             return
+        save_settings(export_dir=output_dir)
 
         self._export_action.setEnabled(False)
         self.statusBar().showMessage("Exporting...")

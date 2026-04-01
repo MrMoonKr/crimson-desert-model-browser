@@ -504,11 +504,29 @@ def write_mtl(meshes: list[Mesh], mtl_path: str, texture_rel_dir: str = "",
             f.write("Ns 100.0\n")
 
             # Only reference textures that exist (if we know what's available)
-            suffixes = [("map_Kd", ""), ("bump", "_n"), ("map_Ks", "_sp")]
-            for mtl_key, suffix in suffixes:
-                dds_name = f"{dds_base}{suffix}.dds"
-                if available_textures is None or dds_name in available_textures:
-                    f.write(f"{mtl_key} {tex_prefix}{suffix}.dds\n")
+            def _tex_exists(suffix):
+                name = f"{dds_base}{suffix}.dds"
+                return available_textures is None or name in available_textures
+
+            # Diffuse: prefer base, fall back to _ma (dye mask) for armor
+            if _tex_exists(""):
+                f.write(f"map_Kd {tex_prefix}.dds\n")
+            elif _tex_exists("_ma"):
+                f.write(f"map_Kd {tex_prefix}_ma.dds\n")
+
+            # Normal map
+            if _tex_exists("_n"):
+                f.write(f"bump {tex_prefix}_n.dds\n")
+
+            # Specular: prefer _sp, fall back to _mg (metallic/gloss)
+            if _tex_exists("_sp"):
+                f.write(f"map_Ks {tex_prefix}_sp.dds\n")
+            elif _tex_exists("_mg"):
+                f.write(f"map_Ks {tex_prefix}_mg.dds\n")
+
+            # Displacement (map_disp is standard MTL)
+            if _tex_exists("_disp"):
+                f.write(f"disp {tex_prefix}_disp.dds\n")
 
             f.write("\n")
 
