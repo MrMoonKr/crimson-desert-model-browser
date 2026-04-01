@@ -473,12 +473,22 @@ class CatalogModel(QAbstractListModel):
             self._all_rows.append(_ITEM_SECTION)
             for header in item_rows:
                 self._all_rows.append(header)
-                for i, pac_name in enumerate(header.pac_files):
+                children = []
+                for pac_name in header.pac_files:
+                    # Try exact match, then _l/_r variants
                     entry = self._pac_lookup.get(pac_name)
                     if entry:
-                        self._all_rows.append(_ItemChildRow(
-                            catalog_entry=entry,
-                            is_last=(i == len(header.pac_files) - 1)))
+                        children.append(entry)
+                    else:
+                        base = pac_name.replace('.pac', '')
+                        for sfx in ('_l.pac', '_r.pac', '_sub01.pac'):
+                            e = self._pac_lookup.get(base + sfx)
+                            if e and e not in children:
+                                children.append(e)
+                for i, entry in enumerate(children):
+                    self._all_rows.append(_ItemChildRow(
+                        catalog_entry=entry,
+                        is_last=(i == len(children) - 1)))
 
         if model_exact or model_fuzzy:
             if item_rows:
