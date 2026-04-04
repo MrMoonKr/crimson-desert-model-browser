@@ -102,6 +102,29 @@ def _():
         max_edge = max(np.linalg.norm(p1 - p0), np.linalg.norm(p2 - p1), np.linalg.norm(p0 - p2))
         assert max_edge < 0.5, f"tri {i//3}: edge={max_edge:.3f} (degenerate)"
 
+@test("Macduff head (3-attr variant [03 00 01 01]): 2 meshes, 2958 verts, formula match")
+def _():
+    e = find_entry("cd_phm_00_head_00_0001_macduff")
+    raw = read_pac_bytes(e)
+    header = parse_header(raw)
+    sec0 = {s['index']: s for s in header['sections']}[0]
+    descs = find_mesh_descriptors(raw, sec0['offset'], sec0['size'])
+    assert len(descs) == 2, f"expected 2 descriptors, got {len(descs)}"
+    total_vc = sum(d.vertex_counts[0] for d in descs)
+    assert total_vc == 2958, f"total verts={total_vc}"
+    # Formula must match exactly (no gap)
+    geom_sec = {s['index']: s for s in header['sections']}[4]
+    total_ic = sum(d.index_counts[0] for d in descs)
+    assert total_vc * 40 + total_ic * 2 == geom_sec['size'], "formula mismatch"
+    # Load and verify no degenerate triangles
+    mesh = load_pac_mesh(e)
+    assert len(mesh.positions) == 2958, f"verts={len(mesh.positions)}"
+    for i in range(0, len(mesh.indices), 3):
+        i0, i1, i2 = mesh.indices[i], mesh.indices[i+1], mesh.indices[i+2]
+        p0, p1, p2 = mesh.positions[i0], mesh.positions[i1], mesh.positions[i2]
+        max_edge = max(np.linalg.norm(p1 - p0), np.linalg.norm(p2 - p1), np.linalg.norm(p0 - p2))
+        assert max_edge < 0.5, f"tri {i//3}: edge={max_edge:.3f} (degenerate)"
+
 
 # ── Index validation ────────────────────────────────────────────────
 
@@ -189,6 +212,11 @@ def _():
     errors = validate_indices("cd_phm_01_sword_0081")
     assert not errors, errors
 
+@test("Macduff head (3-attr variant): all indices valid")
+def _():
+    errors = validate_indices("cd_phm_00_head_00_0001_macduff")
+    assert not errors, errors
+
 
 # ── Section size formula ────────────────────────────────────────────
 
@@ -246,7 +274,7 @@ print("\n=== Preview mesh (load_pac_mesh) ===")
 @test("No NaN or Inf in positions")
 def _():
     for name in ["cd_phm_01_sword_0015", "cd_pgw_00_nude_00_0001", "lightningthrower_0001",
-                  "cd_phm_01_sword_0081"]:
+                  "cd_phm_01_sword_0081", "cd_phm_00_head_00_0001_macduff"]:
         e = find_entry(name)
         mesh = load_pac_mesh(e)
         assert not np.any(np.isnan(mesh.positions)), f"{name}: NaN in positions"
@@ -256,7 +284,7 @@ def _():
 def _():
     for name in ["cd_phm_01_sword_0015", "cd_pgw_00_nude_00_0001", "lightningthrower_0001",
                   "cd_m0001_00_bear_ub_0001", "ancientpeople_sho_belt_0002",
-                  "cd_phm_01_sword_0081"]:
+                  "cd_phm_01_sword_0081", "cd_phm_00_head_00_0001_macduff"]:
         e = find_entry(name)
         mesh = load_pac_mesh(e)
         max_idx = mesh.indices.max()

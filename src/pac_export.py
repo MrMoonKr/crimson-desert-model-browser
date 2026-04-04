@@ -122,6 +122,7 @@ def parse_header(data: bytes) -> dict:
 
 ATTR4_PATTERN = bytes([0x04, 0x00, 0x01, 0x02, 0x03])  # 4-attribute meshes (standard, 4 LODs)
 ATTR3_PATTERN = bytes([0x03, 0x00, 0x01, 0x02])         # 3-attribute meshes (cloth/sim, 3 LODs)
+ATTR3_VARIANT = bytes([0x03, 0x00, 0x01, 0x01])         # 3-attribute variant (heads, attr IDs [0,1,1])
 ATTR2_PATTERN = bytes([0x02, 0x00, 0x01])               # 2-attribute meshes (accessories/physics, 2 LODs)
 
 
@@ -159,31 +160,33 @@ def find_mesh_descriptors(data: bytes, sec0_offset: int, sec0_size: int) -> list
         pos = idx + 5
 
     # Find 3-attribute descriptors (cloth/sim meshes, 3 LODs)
-    pos = 0
-    while True:
-        idx = region.find(ATTR3_PATTERN, pos)
-        if idx == -1:
-            break
-        desc_start = idx - 35
-        if desc_start >= 0 and region[desc_start] == 0x01:
-            # Skip false positives inside 4-attr patterns
-            if idx >= 1 and region[idx - 1] == 0x04:
-                pos = idx + 4
-                continue
-            floats = struct.unpack_from('<8f', region, desc_start + 3)
-            vc3 = [struct.unpack_from('<H', region, desc_start + 40 + i * 2)[0] for i in range(3)]
-            ic3 = [struct.unpack_from('<I', region, desc_start + 46 + i * 4)[0] for i in range(3)]
-            vc = vc3 + [0]  # pad to 4 LODs
-            ic = ic3 + [0]
-            names = _find_name_strings(region, desc_start)
-            found.append((desc_start, MeshDescriptor(
-                display_name=names[0], material_name=names[1],
-                center=(floats[2], floats[3], floats[4]),
-                half_extent=(floats[5], floats[6], floats[7]),
-                vertex_counts=vc, index_counts=ic,
-                bbox_unknowns=(floats[0], floats[1]),
-            )))
-        pos = idx + 4
+    # Two known patterns: standard [03 00 01 02] and variant [03 00 01 01] (heads)
+    for attr3_pattern in (ATTR3_PATTERN, ATTR3_VARIANT):
+        pos = 0
+        while True:
+            idx = region.find(attr3_pattern, pos)
+            if idx == -1:
+                break
+            desc_start = idx - 35
+            if desc_start >= 0 and region[desc_start] == 0x01:
+                # Skip false positives inside 4-attr patterns
+                if idx >= 1 and region[idx - 1] == 0x04:
+                    pos = idx + 4
+                    continue
+                floats = struct.unpack_from('<8f', region, desc_start + 3)
+                vc3 = [struct.unpack_from('<H', region, desc_start + 40 + i * 2)[0] for i in range(3)]
+                ic3 = [struct.unpack_from('<I', region, desc_start + 46 + i * 4)[0] for i in range(3)]
+                vc = vc3 + [0]  # pad to 4 LODs
+                ic = ic3 + [0]
+                names = _find_name_strings(region, desc_start)
+                found.append((desc_start, MeshDescriptor(
+                    display_name=names[0], material_name=names[1],
+                    center=(floats[2], floats[3], floats[4]),
+                    half_extent=(floats[5], floats[6], floats[7]),
+                    vertex_counts=vc, index_counts=ic,
+                    bbox_unknowns=(floats[0], floats[1]),
+                )))
+            pos = idx + 4
 
     # Find 2-attribute descriptors (accessories/physics meshes, 2 LODs)
     pos = 0
