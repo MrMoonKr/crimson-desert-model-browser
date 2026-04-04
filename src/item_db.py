@@ -209,6 +209,9 @@ def parse_iteminfo(game_dir: str, loc_dict: dict[str, str],
 
 # ── Hash table + index builder ────────────────────────────────────
 
+_PAC_PATH_RE = re.compile(rb'character/[a-z_/0-9]+\.pac')
+
+
 def build_hash_table(pamt_entries: list) -> dict[int, str]:
     """Build hash → prefab/PAC basename lookup from PAMT entries."""
     hash_to_name = {}
@@ -222,6 +225,44 @@ def build_hash_table(pamt_entries: list) -> dict[int, str]:
             h = hashlittle(name.encode('ascii'), 0xC5EDE)
             hash_to_name[h] = name
     return hash_to_name
+
+
+def build_prefab_pac_map(pamt_entries: list,
+                         progress_fn=None) -> dict[str, list[str]]:
+    """Read .prefab binaries from PAZ and extract PAC paths they reference.
+
+    Returns {prefab_basename: [pac_basename, ...]} for all prefabs that
+    contain at least one PAC path.  Prefabs are uncompressed/unencrypted,
+    so this is a simple raw read + regex scan (~29 MB, <1 s).
+    """
+    prefab_entries = [e for e in pamt_entries if e.path.endswith('.prefab')]
+    if progress_fn:
+        progress_fn(f"Reading {len(prefab_entries):,} prefab files...")
+
+    # Group by PAZ file for efficient sequential I/O
+    by_paz: dict[str, list] = {}
+    for e in prefab_entries:
+        by_paz.setdefault(e.paz_file, []).append(e)
+
+    result: dict[str, list[str]] = {}
+    for paz_file, entries in by_paz.items():
+        with open(paz_file, 'rb') as f:
+            for e in entries:
+                f.seek(e.offset)
+                data = f.read(e.orig_size)
+                paths = _PAC_PATH_RE.findall(data)
+                if paths:
+                    prefab_base = os.path.splitext(os.path.basename(e.path))[0]
+                    pac_bases = []
+                    for p in paths:
+                        name = p.decode('ascii').rsplit('/', 1)[-1][:-4]  # strip dir + .pac
+                        if name not in pac_bases:
+                            pac_bases.append(name)
+                    result[prefab_base] = pac_bases
+
+    if progress_fn:
+        progress_fn(f"Prefab map: {len(result):,} prefabs with PAC paths")
+    return result
 
 
 def build_item_index(game_dir: str, pamt_0009_entries: list,
@@ -239,6 +280,8 @@ def build_item_index(game_dir: str, pamt_0009_entries: list,
     if progress_fn:
         progress_fn(f"Hash table: {len(hash_table):,} entries")
 
+    prefab_pac_map = build_prefab_pac_map(pamt_0009_entries, progress_fn)
+
     # Resolve prefab hashes → PAC filenames
     pac_to_items: dict[str, list[ItemRecord]] = {}
     items_with_models = []
@@ -249,20 +292,34 @@ def build_item_index(game_dir: str, pamt_0009_entries: list,
 
         for h in item.prefab_hashes:
             resolved = hash_table.get(h)
-            if resolved:
-                # Strip suffixes to get base PAC name
+            if not resolved:
+                continue
+
+            # Try prefab map with full resolved name first (e.g. _u set prefabs)
+            pac_bases = prefab_pac_map.get(resolved)
+
+            if not pac_bases:
+                # Strip suffixes and retry
                 base = resolved
                 for sfx in ('_l', '_r', '_u', '_s', '_t',
                             '_index01', '_index02', '_index03'):
                     if base.endswith(sfx):
                         base = base[:-len(sfx)]
                         break
+                pac_bases = prefab_pac_map.get(base)
+
+            if pac_bases:
+                for pb in pac_bases:
+                    pac_name = pb + '.pac'
+                    if pac_name not in item.pac_files:
+                        item.pac_files.append(pac_name)
+                    pac_to_items.setdefault(pac_name, []).append(item)
+            else:
+                # Direct PAC match (no prefab indirection)
                 pac_name = base + '.pac'
                 if pac_name not in item.pac_files:
                     item.pac_files.append(pac_name)
-                if pac_name not in pac_to_items:
-                    pac_to_items[pac_name] = []
-                pac_to_items[pac_name].append(item)
+                pac_to_items.setdefault(pac_name, []).append(item)
 
         if item.display_name:
             items_with_models.append(item)

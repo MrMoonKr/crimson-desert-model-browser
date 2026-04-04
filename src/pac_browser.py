@@ -690,8 +690,8 @@ def build_catalog(game_dir: str, progress_fn=None) -> tuple[list[CatalogEntry], 
 
         entries = parse_pamt(pamt_path, paz_dir=sub_dir)
 
-        # Cache only mesh and texture entries (skip .xml, .prefab, .hkx, etc.)
-        useful_exts = extensions | {".dds"}
+        # Cache mesh, texture, and prefab entries (skip .xml, .hkx, .paa, etc.)
+        useful_exts = extensions | {".dds", ".prefab"}
         for e in entries:
             lower = e.path.lower()
             if any(lower.endswith(ext) for ext in useful_exts):
@@ -1335,7 +1335,10 @@ class CatalogWorker(QThread):
             try:
                 item_index = build_item_index(self._game_dir, all_entries,
                                               progress_fn=self.progress.emit)
-            except Exception:
+            except Exception as ei:
+                import traceback
+                traceback.print_exc()
+                self.progress.emit(f"Item index failed: {ei}")
                 item_index = None  # non-fatal — app works without item search
             self.catalog_ready.emit(catalog, all_entries, item_index)
         except Exception as e:
