@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Experiments / WIP investigation scripts
+_experiments/
+
 # App settings
 pac_browser.ini
 
