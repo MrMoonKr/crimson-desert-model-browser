@@ -406,6 +406,98 @@ def fix_truncated_dds(data: bytes) -> bytes:
     return bytes(output)
 
 
+# ── Dye color extraction and compositing ────────────────────────────
+
+def parse_pac_xml_colors(xml_data: bytes) -> dict:
+    """Parse decrypted pac.xml to extract per-submesh tint colors.
+
+    Returns {submesh_name: {"R": (r,g,b), "G": (r,g,b), "B": (r,g,b)}}
+    where submesh_name matches MeshDescriptor.display_name.
+    Missing channels are omitted from the dict.
+    """
+    import xml.etree.ElementTree as ET
+    # pac.xml has multiple root elements and may start with BOM — wrap in fake root
+    text = xml_data.lstrip(b'\xef\xbb\xbf')
+    root = ET.fromstring(b'<root>' + text + b'</root>')
+    result = {}
+
+    # Walk SkinnedMeshMaterialWrapper elements — each has _subMeshName
+    for wrapper in root.iter("SkinnedMeshMaterialWrapper"):
+        sub_name = wrapper.get("_subMeshName")
+        if sub_name is None:
+            continue
+
+        # Collect tint colors: prefer _tintColor, fall back to _dyeingDetailLayerColorMask
+        tint = {}
+        detail = {}
+        for param in wrapper.iter("MaterialParameterColor"):
+            name = param.get("_name", "")
+            value = param.get("_value", "")
+            if not value.startswith("#") or len(value) < 7:
+                continue
+            r = int(value[1:3], 16)
+            g = int(value[3:5], 16)
+            b = int(value[5:7], 16)
+            if name.startswith("_tintColor") and name[-1] in "RGB":
+                tint[name[-1]] = (r, g, b)
+            elif name.startswith("_dyeingDetailLayerColorMask") and name[-1] in "RGB":
+                detail[name[-1]] = (r, g, b)
+
+        colors = tint or detail
+        if colors:
+            result[sub_name] = colors
+
+    return result
+
+
+def generate_dyed_texture(ma_path: str, tint_colors: dict,
+                          output_path: str) -> bool:
+    """Composite dye mask + tint colors into a diffuse texture.
+
+    Args:
+        ma_path: path to decompressed _ma.dds file
+        tint_colors: {"R": (r,g,b), "G": (r,g,b), "B": (r,g,b)}
+        output_path: where to write the result PNG
+
+    The _ma.dds R/G/B channels are region masks.  DXT1 block compression
+    creates blended values at region boundaries, so we normalize the mask
+    weights per pixel (sum → 1.0) to prevent ghosting / double-bright edges.
+    """
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        return False
+
+    img = Image.open(ma_path)
+    arr = np.array(img.convert("RGBA"), dtype=np.float32)
+
+    mask_r = arr[:, :, 0]
+    mask_g = arr[:, :, 1]
+    mask_b = arr[:, :, 2]
+
+    # Normalize: make weights sum to 1.0 per pixel to avoid DXT1 edge artifacts
+    total = mask_r + mask_g + mask_b
+    total = np.maximum(total, 1.0)  # avoid division by zero; black stays black
+    mask_r = mask_r / total
+    mask_g = mask_g / total
+    mask_b = mask_b / total
+
+    h, w = mask_r.shape
+    out = np.zeros((h, w, 3), dtype=np.float32)
+
+    for channel, mask in [("R", mask_r), ("G", mask_g), ("B", mask_b)]:
+        if channel in tint_colors:
+            tr, tg, tb = tint_colors[channel]
+            out[:, :, 0] += mask * tr
+            out[:, :, 1] += mask * tg
+            out[:, :, 2] += mask * tb
+
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    Image.fromarray(out, "RGB").save(output_path)
+    return True
+
+
 # ── Material / texture naming ───────────────────────────────────────
 
 def material_to_dds_basename(mat_name: str) -> str:
@@ -558,12 +650,14 @@ def _find_section_layout(data: bytes, geom_sec: dict, descriptors: list,
 
 
 def write_mtl(meshes: list[Mesh], mtl_path: str, texture_rel_dir: str = "",
-              available_textures: set = None):
+              available_textures: set = None, diffuse_overrides: dict = None):
     """Write Wavefront MTL file with DDS texture references.
 
     Args:
         available_textures: if provided, only reference textures in this set (lowercase basenames).
                            If None, reference all textures unconditionally.
+        diffuse_overrides: {material_name: filename} — generated diffuse textures that
+                          replace the default _ma.dds fallback for map_Kd.
     """
     with open(mtl_path, 'w') as f:
         f.write(f"# Materials for {os.path.basename(mtl_path).replace('.mtl', '')}\n\n")
@@ -588,8 +682,12 @@ def write_mtl(meshes: list[Mesh], mtl_path: str, texture_rel_dir: str = "",
                 name = f"{dds_base}{suffix}.dds"
                 return available_textures is None or name in available_textures
 
-            # Diffuse: prefer base, fall back to _ma (dye mask) for armor
-            if _tex_exists(""):
+            # Diffuse: check for generated dye color texture first
+            override = (diffuse_overrides or {}).get(mesh.material)
+            if override:
+                rel = (".\\" + texture_rel_dir + "\\" + override) if texture_rel_dir else override
+                f.write(f"map_Kd {rel}\n")
+            elif _tex_exists(""):
                 f.write(f"map_Kd {tex_prefix}.dds\n")
             elif _tex_exists("_ma"):
                 f.write(f"map_Kd {tex_prefix}_ma.dds\n")

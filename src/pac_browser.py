@@ -30,6 +30,7 @@ from pac_export import (
     parse_header, find_mesh_descriptors, decode_vertices, decode_indices,
     decompress_type1_pac, export_pac, material_to_dds_basename, Vertex,
     write_obj, write_mtl, Mesh, _find_section_layout, fix_truncated_dds,
+    parse_pac_xml_colors, generate_dyed_texture,
 )
 from pam_export import (
     parse_pam_header, parse_pam_submeshes, decompress_pam_geometry,
@@ -42,7 +43,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QStackedWidget, QWidget,
     QVBoxLayout, QHBoxLayout, QLineEdit, QListView,
     QPushButton, QLabel, QFileDialog, QMenuBar, QMessageBox, QComboBox,
-    QStyledItemDelegate, QStyle,
+    QStyledItemDelegate, QStyle, QDialog, QCheckBox,
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QSize, QTimer,
@@ -690,8 +691,8 @@ def build_catalog(game_dir: str, progress_fn=None) -> tuple[list[CatalogEntry], 
 
         entries = parse_pamt(pamt_path, paz_dir=sub_dir)
 
-        # Cache mesh, texture, and prefab entries (skip .xml, .hkx, .paa, etc.)
-        useful_exts = extensions | {".dds", ".prefab"}
+        # Cache mesh, texture, prefab, and pac.xml entries
+        useful_exts = extensions | {".dds", ".prefab", ".pac.xml"}
         for e in entries:
             lower = e.path.lower()
             if any(lower.endswith(ext) for ext in useful_exts):
@@ -899,13 +900,14 @@ def load_pam_mesh(entry: PazEntry) -> GpuMesh:
 
 def export_model_with_textures(entry: PazEntry, output_dir: str,
                                game_dir: str, progress_fn=None,
-                               cached_entries: list[PazEntry] = None) -> dict:
+                               cached_entries: list[PazEntry] = None,
+                               apply_dye_colors: bool = False) -> dict:
     """Export PAC model as OBJ + MTL + DDS textures into a new subfolder.
 
     Creates: output_dir/model_name/
         model_name.obj
         model_name.mtl
-        textures/*.dds
+        textures/*.dds (+ *_diffuse.png when apply_dye_colors=True)
 
     Only references textures in the MTL that actually exist in the archive.
     """
@@ -1004,7 +1006,60 @@ def export_model_with_textures(entry: PazEntry, output_dir: str,
             except Exception:
                 pass
 
-    # Step 2: Write OBJ + MTL, only referencing textures that exist
+    # Step 2: Generate dyed diffuse textures (optional)
+    diffuse_overrides = {}
+    if apply_dye_colors:
+        if progress_fn:
+            progress_fn("Applying dye colors...")
+        # Find and parse the .pac.xml for this model
+        xml_name = model_name + '.pac.xml'
+        xml_matches = [e for e in all_entries
+                       if os.path.basename(e.path).lower() == xml_name.lower()]
+        if xml_matches:
+            import tempfile
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    paz_extract_entry(xml_matches[0], tmp, decrypt_xml=True)
+                    xml_path = os.path.join(tmp, xml_matches[0].path.replace('/', os.sep))
+                    with open(xml_path, 'rb') as xf:
+                        xml_data = xf.read()
+                submesh_colors = parse_pac_xml_colors(xml_data)
+                # Build case-insensitive lookup
+                colors_lower = {k.lower(): v for k, v in submesh_colors.items()}
+
+                # For each unique material, find the best color match.
+                # Priority: exact display_name match > most-channels match.
+                # First material wins — don't let sub-parts overwrite the primary.
+                for desc in descriptors:
+                    if desc.material_name == "(null)":
+                        continue
+                    if desc.material_name in diffuse_overrides:
+                        continue  # already generated for this material
+                    dn = desc.display_name.lower()
+                    # Exact match first
+                    colors = colors_lower.get(dn)
+                    if not colors:
+                        # Prefix match: find XML entries that start with this name
+                        # Pick the one with the most color channels defined
+                        best, best_n = None, 0
+                        for xname, xcolors in colors_lower.items():
+                            if xname.startswith(dn) and len(xcolors) > best_n:
+                                best, best_n = xcolors, len(xcolors)
+                        colors = best
+                    if not colors:
+                        continue
+                    dds_base = material_to_dds_basename(desc.material_name)
+                    ma_file = os.path.join(tex_dir, dds_base + '_ma.dds')
+                    if not os.path.exists(ma_file):
+                        continue
+                    png_name = dds_base + '_diffuse.png'
+                    png_path = os.path.join(tex_dir, png_name)
+                    if generate_dyed_texture(ma_file, colors, png_path):
+                        diffuse_overrides[desc.material_name] = png_name
+            except Exception:
+                pass  # fall back to normal export if dye colors fail
+
+    # Step 3: Write OBJ + MTL, only referencing textures that exist
     if progress_fn:
         progress_fn("Writing OBJ + MTL...")
 
@@ -1012,7 +1067,7 @@ def export_model_with_textures(entry: PazEntry, output_dir: str,
     mtl_path = os.path.join(model_dir, model_name + '.mtl')
     write_obj(meshes, obj_path, model_name + '.mtl')
     write_mtl(meshes, mtl_path, texture_rel_dir="textures",
-              available_textures=available)
+              available_textures=available, diffuse_overrides=diffuse_overrides)
 
     total_verts_out = sum(len(m.vertices) for m in meshes)
     total_tris = sum(len(m.indices) // 3 for m in meshes)
@@ -1382,17 +1437,71 @@ class LoadWorker(QThread):
             self.load_error.emit(f"{self._entry.filename}: {e}")
 
 
+# ── Export dialog ────────────────────────────────────────────────────
+
+class ExportDialog(QDialog):
+    """Export dialog with path selector and dye color option."""
+
+    def __init__(self, default_dir: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export Model")
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+
+        # Path selector row
+        path_row = QHBoxLayout()
+        self._path_edit = QLineEdit(default_dir)
+        self._path_edit.setPlaceholderText("Export directory...")
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse)
+        path_row.addWidget(self._path_edit, 1)
+        path_row.addWidget(browse_btn)
+        layout.addLayout(path_row)
+        layout.addSpacing(8)
+
+        # Dye color checkbox
+        self._dye_check = QCheckBox("Apply default dye colors")
+        layout.addWidget(self._dye_check)
+
+        # Hint text (tight to checkbox)
+        hint = QLabel("Export raw color mask or apply default in-game dye colors to mesh textures")
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        hint.setWordWrap(True)
+        hint.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(hint)
+
+        # Export button
+        export_btn = QPushButton("Export")
+        export_btn.setDefault(True)
+        export_btn.clicked.connect(self.accept)
+        layout.addWidget(export_btn)
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Export to folder", self._path_edit.text())
+        if d:
+            self._path_edit.setText(d)
+
+    def output_dir(self) -> str:
+        return self._path_edit.text().strip()
+
+    def apply_dye_colors(self) -> bool:
+        return self._dye_check.isChecked()
+
+
 class ExportWorker(QThread):
     export_done = Signal(dict)
     export_error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, entry, output_dir, game_dir, cached_entries=None, parent=None):
+    def __init__(self, entry, output_dir, game_dir, cached_entries=None,
+                 apply_dye_colors=False, parent=None):
         super().__init__(parent)
         self._entry = entry
         self._output_dir = output_dir
         self._game_dir = game_dir
         self._cached_entries = cached_entries
+        self._apply_dye_colors = apply_dye_colors
 
     def run(self):
         try:
@@ -1405,7 +1514,8 @@ class ExportWorker(QThread):
                 result = export_model_with_textures(
                     self._entry.paz_entry, self._output_dir,
                     self._game_dir, progress_fn=self.progress.emit,
-                    cached_entries=self._cached_entries)
+                    cached_entries=self._cached_entries,
+                    apply_dye_colors=self._apply_dye_colors)
             self.export_done.emit(result)
         except Exception as e:
             self.export_error.emit(str(e))
@@ -1791,7 +1901,10 @@ class BrowserWindow(QMainWindow):
         if not self._current_entry:
             return
         last_dir = load_settings().get("export_dir", "")
-        output_dir = QFileDialog.getExistingDirectory(self, "Export to folder", last_dir)
+        dlg = ExportDialog(default_dir=last_dir, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        output_dir = dlg.output_dir()
         if not output_dir:
             return
         save_settings(export_dir=output_dir)
@@ -1801,7 +1914,8 @@ class BrowserWindow(QMainWindow):
 
         self._export_worker = ExportWorker(
             self._current_entry, output_dir, self._game_dir,
-            cached_entries=self._all_entries, parent=self)
+            cached_entries=self._all_entries,
+            apply_dye_colors=dlg.apply_dye_colors(), parent=self)
         self._export_worker.progress.connect(self.statusBar().showMessage)
         self._export_worker.export_done.connect(self._on_export_done)
         self._export_worker.export_error.connect(self._on_export_error)
