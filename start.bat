@@ -35,4 +35,18 @@ echo [*] Dependency fetched successfully.
 echo.
 
 :start
+:: Install Python packages if needed (check for PySide6 as marker)
+python -c "import PySide6" >nul 2>&1
+if errorlevel 1 (
+    echo [*] Installing Python dependencies...
+    pip install -r "%~dp0requirements.txt"
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Failed to install dependencies. Check your Python/pip setup.
+        pause
+        exit /b 1
+    )
+    echo.
+)
+
 python "%~dp0src\pac_browser.py" %*
