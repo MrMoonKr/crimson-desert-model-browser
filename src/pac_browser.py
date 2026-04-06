@@ -1464,11 +1464,11 @@ class ExportDialog(QDialog):
         self._dye_check = QCheckBox("Apply default dye colors")
         layout.addWidget(self._dye_check)
 
-        # Hint text (tight to checkbox)
+        # Hint text (indented under checkbox, tight spacing)
         hint = QLabel("Export raw color mask or apply default in-game dye colors to mesh textures")
-        hint.setStyleSheet("color: gray; font-size: 11px;")
+        hint.setStyleSheet("color: gray; font-size: 11px; margin-top: -2px;")
         hint.setWordWrap(True)
-        hint.setContentsMargins(0, 0, 0, 0)
+        hint.setContentsMargins(22, 0, 0, 0)
         layout.addWidget(hint)
 
         # Export button
