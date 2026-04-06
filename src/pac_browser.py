@@ -29,7 +29,7 @@ from paz_crypto import decrypt as paz_decrypt, lz4_decompress
 from pac_export import (
     parse_header, find_mesh_descriptors, decode_vertices, decode_indices,
     decompress_type1_pac, export_pac, material_to_dds_basename, Vertex,
-    write_obj, write_mtl, Mesh, _find_section_layout,
+    write_obj, write_mtl, Mesh, _find_section_layout, fix_truncated_dds,
 )
 from pam_export import (
     parse_pam_header, parse_pam_submeshes, decompress_pam_geometry,
@@ -990,6 +990,15 @@ def export_model_with_textures(entry: PazEntry, output_dir: str,
                             d = os.path.dirname(d)
                     except OSError:
                         pass
+                # Fix truncated DDS (streaming textures missing top mips)
+                flat = os.path.join(tex_dir, os.path.basename(m.path))
+                if os.path.exists(flat):
+                    with open(flat, 'rb') as df:
+                        dds_raw = df.read()
+                    fixed = fix_truncated_dds(dds_raw)
+                    if len(fixed) != len(dds_raw):
+                        with open(flat, 'wb') as df:
+                            df.write(fixed)
                 available.add(dds_name.lower())
                 extracted += 1
             except Exception:
@@ -1062,6 +1071,15 @@ def export_pam_with_textures(entry: PazEntry, output_dir: str,
                             d = os.path.dirname(d)
                     except OSError:
                         pass
+                # Fix truncated DDS (streaming textures missing top mips)
+                flat = os.path.join(tex_dir, os.path.basename(m.path))
+                if os.path.exists(flat):
+                    with open(flat, 'rb') as df:
+                        dds_raw = df.read()
+                    fixed = fix_truncated_dds(dds_raw)
+                    if len(fixed) != len(dds_raw):
+                        with open(flat, 'wb') as df:
+                            df.write(fixed)
                 available.add(dds_name)
                 extracted += 1
             except Exception:

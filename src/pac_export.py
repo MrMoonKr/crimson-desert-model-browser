@@ -329,6 +329,83 @@ def decode_indices(data: bytes, section_offset: int,
     return indices
 
 
+# ── DDS per-mip decompression (type 1 DDS) ─────────────────────────
+
+def fix_truncated_dds(data: bytes) -> bytes:
+    """Decompress type 1 DDS files that use per-mip LZ4 compression.
+
+    BlackSpace Engine stores per-mip compressed sizes in the DDS header's
+    Reserved1[0..3] fields (offsets 32-47).  When a stored size is smaller
+    than the expected decompressed mip size, that mip is LZ4 block-compressed.
+    Mips 4+ are always stored raw (too small to benefit from compression).
+
+    This function detects compressed mips, decompresses them, clears the
+    non-standard Reserved1 fields, and returns a standard DDS file.
+    Files with no per-mip compression are returned unchanged.
+    """
+    if len(data) < 128 or data[:4] != b'DDS ':
+        return data
+
+    height = struct.unpack_from('<I', data, 12)[0]
+    width = struct.unpack_from('<I', data, 16)[0]
+    mips = struct.unpack_from('<I', data, 28)[0]
+    fourcc = data[84:88]
+
+    # Bytes per 4×4 block by compressed format
+    BPB = {
+        b'DXT1': 8,  b'DXT3': 16, b'DXT5': 16,
+        b'BC4U': 8,  b'BC4S': 8,  b'ATI1': 8,
+        b'BC5U': 16, b'BC5S': 16, b'ATI2': 16,
+    }
+    bpb = BPB.get(fourcc)
+    if bpb is None or mips < 1:
+        return data
+
+    # Calculate expected decompressed size per mip
+    mip_decomp = []
+    w, h = width, height
+    for _ in range(mips):
+        bw, bh = max(1, w // 4), max(1, h // 4)
+        mip_decomp.append(bw * bh * bpb)
+        w, h = max(1, w // 2), max(1, h // 2)
+
+    # Read Reserved1[0..3] — per-mip stored sizes (0 = use decompressed size)
+    stored = [struct.unpack_from('<I', data, 32 + i * 4)[0] for i in range(4)]
+
+    # Check if any mip is actually compressed (stored < expected)
+    needs_decompress = False
+    for i in range(min(4, mips)):
+        if stored[i] > 0 and stored[i] < mip_decomp[i]:
+            needs_decompress = True
+            break
+
+    if not needs_decompress:
+        return data
+
+    # Decompress per-mip, reassemble standard DDS
+    import lz4.block
+    hdr = bytearray(data[:128])
+    # Clear Reserved1 fields (non-standard, would confuse DDS tools)
+    for i in range(11):
+        struct.pack_into('<I', hdr, 32 + i * 4, 0)
+
+    output = bytearray(hdr)
+    offset = 128
+    for m in range(mips):
+        decomp_size = mip_decomp[m]
+        # Mips 0-3 use Reserved1; mips 4+ are always raw
+        stored_size = stored[m] if m < 4 and stored[m] > 0 else decomp_size
+
+        chunk = data[offset:offset + stored_size]
+        if stored_size < decomp_size:
+            output.extend(lz4.block.decompress(chunk, uncompressed_size=decomp_size))
+        else:
+            output.extend(chunk)
+        offset += stored_size
+
+    return bytes(output)
+
+
 # ── Material / texture naming ───────────────────────────────────────
 
 def material_to_dds_basename(mat_name: str) -> str:
