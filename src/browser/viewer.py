@@ -135,9 +135,18 @@ uniform vec3 uColor;
 void main() {
     vec3 N = normalize(vNormal);
     vec3 L = normalize(uLightDir);
-    float diff = max(abs(dot(N, L)), 0.0);
-    vec3 ambient = 0.18 * uColor;
-    vec3 diffuse = 0.82 * diff * uColor;
+
+    // Hemisphere ambient: sky (top) vs ground (bottom)
+    vec3 skyColor = vec3(0.35, 0.35, 0.40);
+    vec3 groundColor = vec3(0.12, 0.12, 0.14);
+    float hemi = N.y * 0.5 + 0.5;
+    vec3 ambient = mix(groundColor, skyColor, hemi) * uColor;
+
+    // Half-Lambert wrapped diffuse (no hard shadow cutoff)
+    float halfLambert = dot(N, L) * 0.5 + 0.5;
+    halfLambert *= halfLambert;
+    vec3 diffuse = 0.65 * halfLambert * uColor;
+
     FragColor = vec4(ambient + diffuse, 1.0);
 }
 """
