@@ -8,9 +8,9 @@ from PySide6.QtCore import QThread, Signal
 
 from pac_parser import PacParser, decompress_type1_pac, material_to_dds_basename
 from pam_parser import PamParser, decompress_pam_geometry
-from pac_export import Vertex, Mesh, write_obj, write_mtl
-from pam_export import export_pam
 from model_types import ParsedModel
+from exporters import get_exporter
+from exporters.base import ExportOptions
 from texture_service import TextureService
 from browser.models import CatalogEntry, GpuMesh, SceneMesh, SubmeshInfo
 
@@ -149,19 +149,6 @@ def export_model_with_textures(entry, output_dir: str,
 
     model = PacParser().parse(pac_data, lods=[0])
 
-    meshes = []
-    for sm in model.submeshes:
-        geom = sm.get_geometry(sm.best_lod())
-        if geom is None:
-            continue
-        vb, ib = geom
-        verts = [Vertex(pos=tuple(float(x) for x in vb.positions[i]),
-                        uv=tuple(float(x) for x in vb.uvs[i]),
-                        normal=tuple(float(x) for x in vb.normals[i]))
-                 for i in range(vb.count)]
-        meshes.append(Mesh(name=sm.name, material=sm.material_name,
-                           vertices=verts, indices=[int(x) for x in ib.indices]))
-
     # Extract textures via TextureService
     tex_svc = TextureService(game_dir, cached_entries=cached_entries)
     tex_basenames = [sm.texture_basename for sm in model.submeshes if sm.texture_basename]
@@ -175,23 +162,25 @@ def export_model_with_textures(entry, output_dir: str,
         diffuse_overrides = tex_svc.apply_dye_colors(model_name, submesh_pairs,
                                                       tex_dir, progress_fn=progress_fn)
 
-    # Write OBJ + MTL
+    # Write OBJ + MTL via exporter
     if progress_fn:
         progress_fn("Writing OBJ + MTL...")
 
-    obj_path = os.path.join(model_dir, model_name + '.obj')
-    mtl_path = os.path.join(model_dir, model_name + '.mtl')
-    write_obj(meshes, obj_path, model_name + '.mtl')
-    write_mtl(meshes, mtl_path, texture_rel_dir="textures",
-              available_textures=available, diffuse_overrides=diffuse_overrides)
-
-    total_verts_out = sum(len(m.vertices) for m in meshes)
-    total_tris = sum(len(m.indices) // 3 for m in meshes)
+    options = ExportOptions(
+        name_hint=model_name,
+        texture_rel_dir="textures",
+        available_textures=available,
+        diffuse_overrides=diffuse_overrides,
+    )
+    result = get_exporter('obj').export_to_disk(model, model_dir, options)
 
     return {
-        'obj': obj_path, 'mtl': mtl_path,
-        'meshes': len(meshes), 'vertices': total_verts_out, 'triangles': total_tris,
-        'names': [m.name for m in meshes],
+        'obj': result.output_files[0],
+        'mtl': result.output_files[1],
+        'meshes': result.stats['meshes'],
+        'vertices': result.stats['vertices'],
+        'triangles': result.stats['triangles'],
+        'names': result.stats['names'],
         'textures_extracted': extracted,
         'textures_expected': len(set(sm.texture_basename for sm in model.submeshes if sm.texture_basename)),
         'export_dir': model_dir,
@@ -208,7 +197,7 @@ def export_pam_with_textures(entry, output_dir: str,
     tex_dir = os.path.join(model_dir, "textures")
     os.makedirs(tex_dir, exist_ok=True)
 
-    # Parse to get texture names
+    # Parse once — used for both texture extraction and OBJ export
     model = PamParser().parse(pam_data)
     dds_filenames = [sm.texture_basename + '.dds'
                      for sm in model.submeshes if sm.texture_basename]
@@ -218,16 +207,28 @@ def export_pam_with_textures(entry, output_dir: str,
     available, extracted = tex_svc.extract_dds_files(dds_filenames, tex_dir,
                                                      progress_fn=progress_fn)
 
-    # Write OBJ + MTL
+    # Write OBJ + MTL via exporter (reuses parsed model, no double-parse)
     if progress_fn:
         progress_fn("Writing OBJ + MTL...")
 
-    result = export_pam(pam_data, model_dir, name_hint=model_name,
-                        texture_rel_dir="textures", available_textures=available)
-    result['textures_extracted'] = extracted
-    result['textures_expected'] = len(set(dds_filenames))
-    result['export_dir'] = model_dir
-    return result
+    options = ExportOptions(
+        name_hint=model_name,
+        texture_rel_dir="textures",
+        available_textures=available,
+    )
+    result = get_exporter('obj').export_to_disk(model, model_dir, options)
+
+    return {
+        'obj': result.output_files[0],
+        'mtl': result.output_files[1],
+        'meshes': result.stats['meshes'],
+        'vertices': result.stats['vertices'],
+        'triangles': result.stats['triangles'],
+        'names': result.stats['names'],
+        'textures_extracted': extracted,
+        'textures_expected': len(set(dds_filenames)),
+        'export_dir': model_dir,
+    }
 
 
 # ── Background workers ────────────────────────────────────────────

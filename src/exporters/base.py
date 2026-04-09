@@ -1,8 +1,26 @@
-"""Base class and result types for mesh exporters."""
+"""Base class and result types for mesh exporters.
+
+Plugin contract:
+- Each exporter subclasses MeshExporter and sets format_id/format_name/file_extension.
+- export_to_disk() receives a ParsedModel (format-agnostic) + ExportOptions.
+- Returns ExportResult with output file paths, stats, and warnings.
+- Register new exporters in exporters/__init__.py.
+"""
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Optional
 from model_types import ParsedModel
+
+
+@dataclass
+class ExportOptions:
+    """Options shared across all export formats."""
+    lod: int = 0
+    name_hint: str = ""
+    texture_rel_dir: str = ""
+    available_textures: Optional[set] = None
+    diffuse_overrides: Optional[dict] = None
 
 
 @dataclass
@@ -29,9 +47,8 @@ class MeshExporter(ABC):
 
     @abstractmethod
     def export_to_disk(self, model: ParsedModel, output_dir: str,
-                       name_hint: str = "", texture_rel_dir: str = "",
-                       available_textures: set = None,
-                       diffuse_overrides: dict = None) -> ExportResult:
+                       options: ExportOptions = None) -> ExportResult:
+        """Export model to disk. Options default to ExportOptions() if None."""
         ...
 
     def export_to_bytes(self, model: ParsedModel, **kwargs) -> bytes:

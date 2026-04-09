@@ -217,140 +217,38 @@ def generate_dyed_texture(ma_path: str, tint_colors: dict,
     return True
 
 
-# ── OBJ + MTL writing ──
+# ── OBJ + MTL writing (re-exported from exporters for backward compat) ──
 
-def write_mtl(meshes: list[Mesh], mtl_path: str, texture_rel_dir: str = "",
-              available_textures: set = None, diffuse_overrides: dict = None):
-    with open(mtl_path, 'w') as f:
-        f.write(f"# Materials for {os.path.basename(mtl_path).replace('.mtl', '')}\n\n")
-
-        seen = set()
-        for mesh in meshes:
-            if mesh.material in seen or mesh.material == "(null)":
-                continue
-            seen.add(mesh.material)
-
-            dds_base = material_to_dds_basename(mesh.material)
-            tex_prefix = (".\\" + texture_rel_dir + "\\" + dds_base) if texture_rel_dir else dds_base
-
-            f.write(f"newmtl {mesh.material}\n")
-            f.write("Ka 0.2 0.2 0.2\n")
-            f.write("Kd 0.8 0.8 0.8\n")
-            f.write("Ks 0.5 0.5 0.5\n")
-            f.write("Ns 100.0\n")
-
-            def _tex_exists(suffix):
-                name = f"{dds_base}{suffix}.dds"
-                return available_textures is None or name in available_textures
-
-            override = (diffuse_overrides or {}).get(mesh.material)
-            if override:
-                rel = (".\\" + texture_rel_dir + "\\" + override) if texture_rel_dir else override
-                f.write(f"map_Kd {rel}\n")
-            elif _tex_exists(""):
-                f.write(f"map_Kd {tex_prefix}.dds\n")
-            elif _tex_exists("_ma"):
-                f.write(f"map_Kd {tex_prefix}_ma.dds\n")
-
-            if _tex_exists("_n"):
-                f.write(f"bump {tex_prefix}_n.dds\n")
-
-            if _tex_exists("_sp"):
-                f.write(f"map_Ks {tex_prefix}_sp.dds\n")
-            elif _tex_exists("_mg"):
-                f.write(f"map_Ks {tex_prefix}_mg.dds\n")
-
-            if _tex_exists("_disp"):
-                f.write(f"disp {tex_prefix}_disp.dds\n")
-
-            f.write("\n")
-
-
-def write_obj(meshes: list[Mesh], obj_path: str, mtl_filename: str):
-    with open(obj_path, 'w') as f:
-        f.write(f"# Crimson Desert PAC export\n")
-        f.write(f"mtllib {mtl_filename}\n\n")
-
-        vert_offset = 0
-
-        for mesh in meshes:
-            f.write(f"o {mesh.name}\n")
-            f.write(f"usemtl {mesh.material}\n")
-
-            for v in mesh.vertices:
-                x, y, z = v.pos
-                f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
-
-            for v in mesh.vertices:
-                nx, ny, nz = v.normal
-                f.write(f"vn {nx:.6f} {ny:.6f} {nz:.6f}\n")
-
-            for v in mesh.vertices:
-                u, v_coord = v.uv
-                f.write(f"vt {u:.6f} {1.0 - v_coord:.6f}\n")
-
-            for i in range(0, len(mesh.indices), 3):
-                i0 = mesh.indices[i] + vert_offset + 1
-                i1 = mesh.indices[i + 1] + vert_offset + 1
-                i2 = mesh.indices[i + 2] + vert_offset + 1
-                f.write(f"f {i0}/{i0}/{i0} {i1}/{i1}/{i1} {i2}/{i2}/{i2}\n")
-
-            vert_offset += len(mesh.vertices)
-            f.write("\n")
+from exporters.obj_exporter import write_obj, write_mtl
 
 
 # ── Main export logic ──
 
 def export_pac(pac_data: bytes, output_dir: str, name_hint: str = "",
                texture_rel_dir: str = "", lod: int = 0) -> dict:
-    """Export a PAC file to OBJ + MTL using the new parser."""
+    """Export a PAC file to OBJ + MTL via the exporter plugin."""
+    from exporters import get_exporter
+    from exporters.base import ExportOptions
+
     model = _parser.parse(pac_data, lods=[lod])
 
-    meshes = []
-    for sm in model.submeshes:
-        geom = sm.get_geometry(lod)
-        if geom is None:
-            continue
-        vb, ib = geom
-        verts = []
-        for i in range(vb.count):
-            verts.append(Vertex(
-                pos=tuple(float(x) for x in vb.positions[i]),
-                uv=tuple(float(x) for x in vb.uvs[i]),
-                normal=tuple(float(x) for x in vb.normals[i]),
-            ))
-        meshes.append(Mesh(
-            name=sm.name,
-            material=sm.material_name,
-            vertices=verts,
-            indices=[int(x) for x in ib.indices],
-        ))
+    options = ExportOptions(
+        lod=lod,
+        name_hint=name_hint,
+        texture_rel_dir=texture_rel_dir,
+    )
+    result = get_exporter('obj').export_to_disk(model, output_dir, options)
 
-    if not meshes:
-        raise ValueError("No meshes with geometry found")
-
-    base_name = name_hint or meshes[0].name.lower()
-    base_name = base_name.replace(' ', '_')
-    obj_filename = base_name + '.obj'
-    mtl_filename = base_name + '.mtl'
-
-    os.makedirs(output_dir, exist_ok=True)
-    obj_path = os.path.join(output_dir, obj_filename)
-    mtl_path = os.path.join(output_dir, mtl_filename)
-
-    write_obj(meshes, obj_path, mtl_filename)
-    write_mtl(meshes, mtl_path, texture_rel_dir)
-
-    total_verts_out = sum(len(m.vertices) for m in meshes)
-    total_tris = sum(len(m.indices) // 3 for m in meshes)
+    if not result.success:
+        raise ValueError(result.warnings[0].message if result.warnings else "Export failed")
 
     return {
-        'obj': obj_path,
-        'mtl': mtl_path,
-        'meshes': len(meshes),
-        'vertices': total_verts_out,
-        'triangles': total_tris,
-        'names': [m.name for m in meshes],
+        'obj': result.output_files[0],
+        'mtl': result.output_files[1],
+        'meshes': result.stats['meshes'],
+        'vertices': result.stats['vertices'],
+        'triangles': result.stats['triangles'],
+        'names': result.stats['names'],
     }
 
 

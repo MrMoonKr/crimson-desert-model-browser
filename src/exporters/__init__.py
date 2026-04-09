@@ -1,6 +1,10 @@
-"""Mesh export format plugins."""
+"""Mesh export format plugins.
 
-from exporters.base import MeshExporter, ExportResult, ExportWarning
+To add a new format: create a new file (e.g. gltf_exporter.py),
+subclass MeshExporter, implement export_to_disk(), and register below.
+"""
+
+from exporters.base import MeshExporter, ExportResult, ExportWarning, ExportOptions
 from exporters.obj_exporter import ObjExporter
 
 _EXPORTERS = {

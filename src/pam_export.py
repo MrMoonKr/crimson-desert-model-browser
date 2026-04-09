@@ -10,7 +10,7 @@ import sys
 import struct
 import argparse
 
-from pac_export import Vertex, Mesh, write_obj, write_mtl
+from pac_export import Vertex, Mesh  # legacy types, used by decode_pam_vertices wrapper
 from pam_parser import PamParser, decompress_pam_geometry
 
 _parser = PamParser()
@@ -46,49 +46,29 @@ def decode_pam_indices(data, byte_offset, count, index_size=2):
 
 def export_pam(pam_data: bytes, output_dir: str, name_hint: str = "",
                texture_rel_dir: str = "", available_textures: set = None) -> dict:
-    """Export a PAM file to OBJ + MTL using the new parser."""
+    """Export a PAM file to OBJ + MTL via the exporter plugin."""
+    from exporters import get_exporter
+    from exporters.base import ExportOptions
+
     model = _parser.parse(pam_data)
 
-    meshes = []
-    for sm in model.submeshes:
-        geom = sm.get_geometry(0)
-        if geom is None:
-            continue
-        vb, ib = geom
-        verts = []
-        for i in range(vb.count):
-            verts.append(Vertex(
-                pos=tuple(float(x) for x in vb.positions[i]),
-                uv=tuple(float(x) for x in vb.uvs[i]),
-                normal=tuple(float(x) for x in vb.normals[i]),
-            ))
-        meshes.append(Mesh(
-            name=sm.name,
-            material=sm.material_name,
-            vertices=verts,
-            indices=[int(x) for x in ib.indices],
-        ))
+    options = ExportOptions(
+        name_hint=name_hint,
+        texture_rel_dir=texture_rel_dir,
+        available_textures=available_textures,
+    )
+    result = get_exporter('obj').export_to_disk(model, output_dir, options)
 
-    if not meshes:
-        raise ValueError("No meshes with geometry found")
-
-    base_name = name_hint or meshes[0].name.lower().replace(' ', '_')
-    obj_filename = base_name + '.obj'
-    mtl_filename = base_name + '.mtl'
-
-    os.makedirs(output_dir, exist_ok=True)
-    obj_path = os.path.join(output_dir, obj_filename)
-    mtl_path = os.path.join(output_dir, mtl_filename)
-
-    write_obj(meshes, obj_path, mtl_filename)
-    write_mtl(meshes, mtl_path, texture_rel_dir, available_textures=available_textures)
+    if not result.success:
+        raise ValueError(result.warnings[0].message if result.warnings else "Export failed")
 
     return {
-        'obj': obj_path, 'mtl': mtl_path,
-        'meshes': len(meshes),
-        'vertices': sum(len(m.vertices) for m in meshes),
-        'triangles': sum(len(m.indices) // 3 for m in meshes),
-        'names': [m.name for m in meshes],
+        'obj': result.output_files[0],
+        'mtl': result.output_files[1],
+        'meshes': result.stats['meshes'],
+        'vertices': result.stats['vertices'],
+        'triangles': result.stats['triangles'],
+        'names': result.stats['names'],
     }
 
 
