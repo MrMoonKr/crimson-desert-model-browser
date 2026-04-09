@@ -22,6 +22,9 @@ class TextureService:
         self._entries = cached_entries
         self._basename_index = None  # dict[str, list[PazEntry]] -- built lazily
 
+    # Directories that contain DDS textures
+    _TEXTURE_DIRS = ["0009", "0000", "0007", "0015"]
+
     def _ensure_index(self):
         """Build basename -> [PazEntry] index once."""
         if self._basename_index is not None:
@@ -33,8 +36,12 @@ class TextureService:
             if unpacker_dir not in sys.path:
                 sys.path.insert(0, unpacker_dir)
             from paz_parse import parse_pamt
-            dir_0009 = os.path.join(self._game_dir, "0009")
-            self._entries = parse_pamt(os.path.join(dir_0009, "0.pamt"), paz_dir=dir_0009)
+            self._entries = []
+            for dir_name in self._TEXTURE_DIRS:
+                pamt_path = os.path.join(self._game_dir, dir_name, "0.pamt")
+                if os.path.isfile(pamt_path):
+                    sub_dir = os.path.join(self._game_dir, dir_name)
+                    self._entries.extend(parse_pamt(pamt_path, paz_dir=sub_dir))
         self._basename_index = {}
         for e in self._entries:
             bn = os.path.basename(e.path).lower()

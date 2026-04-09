@@ -1,7 +1,6 @@
 """Data loading, mesh conversion, and export functions for the model browser."""
 
 import os
-import tempfile
 
 import numpy as np
 
@@ -9,13 +8,11 @@ from PySide6.QtCore import QThread, Signal
 
 from pac_parser import PacParser, decompress_type1_pac, material_to_dds_basename
 from pam_parser import PamParser, decompress_pam_geometry
-from pac_export import (
-    Vertex, Mesh, write_obj, write_mtl, fix_truncated_dds,
-    parse_pac_xml_colors, generate_dyed_texture,
-)
-from pam_export import export_pam, parse_pam_header, parse_pam_submeshes
+from pac_export import Vertex, Mesh, write_obj, write_mtl
+from pam_export import export_pam
 from model_types import ParsedModel
-from browser.models import CatalogEntry, GpuMesh
+from texture_service import TextureService
+from browser.models import CatalogEntry, GpuMesh, SceneMesh, SubmeshInfo
 
 
 # ── PAC / PAM byte readers ────────────────────────────────────────
@@ -70,18 +67,71 @@ def _model_to_gpu_mesh(model: ParsedModel) -> GpuMesh:
     return GpuMesh(positions, normals, indices, center, radius)
 
 
-def load_pac_mesh(entry) -> GpuMesh:
+def _model_to_scene_mesh(model: ParsedModel) -> SceneMesh:
+    """Convert a ParsedModel into a SceneMesh with per-submesh info."""
+    all_pos, all_nor, all_uv, all_idx = [], [], [], []
+    submesh_infos = []
+    vertex_offset = 0
+    index_offset = 0
+
+    for sm in model.submeshes:
+        geom = sm.get_geometry(sm.best_lod())
+        if geom is None:
+            continue
+        vb, ib = geom
+        all_pos.append(vb.positions)
+        all_nor.append(vb.normals)
+        all_uv.append(vb.uvs)
+        idx = ib.indices.astype(np.uint32) + vertex_offset
+        all_idx.append(idx)
+
+        submesh_infos.append(SubmeshInfo(
+            name=sm.name,
+            material_name=sm.material_name,
+            index_offset=index_offset * 4,  # byte offset (uint32 = 4 bytes)
+            index_count=ib.count,
+        ))
+
+        vertex_offset += vb.count
+        index_offset += ib.count
+
+    positions = np.concatenate(all_pos)
+    normals = np.concatenate(all_nor)
+    uvs = np.concatenate(all_uv)
+    indices = np.concatenate(all_idx)
+
+    bbox_min = positions.min(axis=0)
+    bbox_max = positions.max(axis=0)
+    center = (bbox_min + bbox_max) / 2.0
+    radius = float(np.linalg.norm(positions - center, axis=1).max())
+    if radius < 1e-6:
+        radius = 1.0
+
+    return SceneMesh(
+        positions=positions,
+        normals=normals,
+        uvs=uvs,
+        indices=indices,
+        submeshes=submesh_infos,
+        center=center,
+        radius=radius,
+        available_lods=list(model.available_lods),
+        current_lod=model.submeshes[0].best_lod() if model.submeshes else 0,
+    )
+
+
+def load_pac_mesh(entry) -> SceneMesh:
     raw = read_pac_bytes(entry)
     parser = PacParser()
     model = parser.parse(raw, lods=[0])
-    return _model_to_gpu_mesh(model)
+    return _model_to_scene_mesh(model)
 
 
-def load_pam_mesh(entry) -> GpuMesh:
+def load_pam_mesh(entry) -> SceneMesh:
     raw = read_pam_bytes(entry)
     parser = PamParser()
     model = parser.parse(raw)
-    return _model_to_gpu_mesh(model)
+    return _model_to_scene_mesh(model)
 
 
 # ── Export (OBJ + MTL + DDS textures) ─────────────────────────────
@@ -90,24 +140,13 @@ def export_model_with_textures(entry, output_dir: str,
                                game_dir: str, progress_fn=None,
                                cached_entries=None,
                                apply_dye_colors: bool = False) -> dict:
-    """Export PAC model as OBJ + MTL + DDS textures into a new subfolder.
-
-    Creates: output_dir/model_name/
-        model_name.obj
-        model_name.mtl
-        textures/*.dds (+ *_diffuse.png when apply_dye_colors=True)
-
-    Only references textures in the MTL that actually exist in the archive.
-    """
-    from paz_unpack import extract_entry as paz_extract_entry
-
+    """Export PAC model as OBJ + MTL + DDS textures via TextureService."""
     pac_data = read_pac_bytes(entry)
     model_name = os.path.splitext(os.path.basename(entry.path))[0]
     model_dir = os.path.join(output_dir, model_name)
     tex_dir = os.path.join(model_dir, "textures")
     os.makedirs(tex_dir, exist_ok=True)
 
-    # Parse geometry via PacParser
     model = PacParser().parse(pac_data, lods=[0])
 
     meshes = []
@@ -123,111 +162,20 @@ def export_model_with_textures(entry, output_dir: str,
         meshes.append(Mesh(name=sm.name, material=sm.material_name,
                            vertices=verts, indices=[int(x) for x in ib.indices]))
 
-    # Step 1: Extract textures first, track what's available
-    if progress_fn:
-        progress_fn("Extracting textures...")
+    # Extract textures via TextureService
+    tex_svc = TextureService(game_dir, cached_entries=cached_entries)
+    tex_basenames = [sm.texture_basename for sm in model.submeshes if sm.texture_basename]
+    available, extracted = tex_svc.extract_textures(tex_basenames, tex_dir,
+                                                     progress_fn=progress_fn)
 
-    dds_wanted = set()
-    for sm in model.submeshes:
-        if not sm.texture_basename:
-            continue
-        for suffix in ['', '_n', '_sp', '_m', '_mg', '_ma', '_disp', '_o']:
-            dds_wanted.add(sm.texture_basename + suffix + '.dds')
-
-    if cached_entries is not None:
-        all_entries = cached_entries
-    else:
-        from paz_parse import parse_pamt
-        dir_0009 = os.path.join(game_dir, "0009")
-        all_entries = parse_pamt(os.path.join(dir_0009, "0.pamt"), paz_dir=dir_0009)
-
-    available = set()  # lowercase DDS basenames that were actually extracted
-    extracted = 0
-    for dds_name in dds_wanted:
-        matches = [e for e in all_entries
-                   if os.path.basename(e.path).lower() == dds_name.lower()]
-        for m in matches:
-            try:
-                paz_extract_entry(m, tex_dir, decrypt_xml=False)
-                # Move from nested path to flat textures dir
-                nested = os.path.join(tex_dir, m.path.replace('/', os.sep))
-                flat = os.path.join(tex_dir, os.path.basename(m.path))
-                if os.path.exists(nested) and nested != flat:
-                    os.replace(nested, flat)
-                    try:
-                        d = os.path.dirname(nested)
-                        while d != tex_dir:
-                            os.rmdir(d)
-                            d = os.path.dirname(d)
-                    except OSError:
-                        pass
-                # Fix truncated DDS (streaming textures missing top mips)
-                flat = os.path.join(tex_dir, os.path.basename(m.path))
-                if os.path.exists(flat):
-                    with open(flat, 'rb') as df:
-                        dds_raw = df.read()
-                    fixed = fix_truncated_dds(dds_raw)
-                    if len(fixed) != len(dds_raw):
-                        with open(flat, 'wb') as df:
-                            df.write(fixed)
-                available.add(dds_name.lower())
-                extracted += 1
-            except Exception:
-                pass
-
-    # Step 2: Generate dyed diffuse textures (optional)
+    # Dye colors via TextureService
     diffuse_overrides = {}
     if apply_dye_colors:
-        if progress_fn:
-            progress_fn("Applying dye colors...")
-        # Find and parse the .pac.xml for this model
-        xml_name = model_name + '.pac.xml'
-        xml_matches = [e for e in all_entries
-                       if os.path.basename(e.path).lower() == xml_name.lower()]
-        if xml_matches:
-            try:
-                with tempfile.TemporaryDirectory() as tmp:
-                    paz_extract_entry(xml_matches[0], tmp, decrypt_xml=True)
-                    xml_path = os.path.join(tmp, xml_matches[0].path.replace('/', os.sep))
-                    with open(xml_path, 'rb') as xf:
-                        xml_data = xf.read()
-                submesh_colors = parse_pac_xml_colors(xml_data)
-                # Build case-insensitive lookup
-                colors_lower = {k.lower(): v for k, v in submesh_colors.items()}
+        submesh_pairs = [(sm.name, sm.material_name) for sm in model.submeshes]
+        diffuse_overrides = tex_svc.apply_dye_colors(model_name, submesh_pairs,
+                                                      tex_dir, progress_fn=progress_fn)
 
-                # For each unique material, find the best color match.
-                # Priority: exact display_name match > most-channels match.
-                # First material wins -- don't let sub-parts overwrite the primary.
-                for sm in model.submeshes:
-                    if sm.material_name == "(null)":
-                        continue
-                    if sm.material_name in diffuse_overrides:
-                        continue  # already generated for this material
-                    dn = sm.name.lower()
-                    # Exact match first
-                    colors = colors_lower.get(dn)
-                    if not colors:
-                        # Prefix match: find XML entries that start with this name
-                        # Pick the one with the most color channels defined
-                        best, best_n = None, 0
-                        for xname, xcolors in colors_lower.items():
-                            if xname.startswith(dn) and len(xcolors) > best_n:
-                                best, best_n = xcolors, len(xcolors)
-                        colors = best
-                    if not colors:
-                        continue
-                    dds_base = material_to_dds_basename(sm.material_name)
-                    ma_file = os.path.join(tex_dir, dds_base + '_ma.dds')
-                    if not os.path.exists(ma_file):
-                        continue
-                    png_name = dds_base + '_diffuse.png'
-                    png_path = os.path.join(tex_dir, png_name)
-                    if generate_dyed_texture(ma_file, colors, png_path):
-                        diffuse_overrides[sm.material_name] = png_name
-            except Exception:
-                pass  # fall back to normal export if dye colors fail
-
-    # Step 3: Write OBJ + MTL, only referencing textures that exist
+    # Write OBJ + MTL
     if progress_fn:
         progress_fn("Writing OBJ + MTL...")
 
@@ -244,7 +192,8 @@ def export_model_with_textures(entry, output_dir: str,
         'obj': obj_path, 'mtl': mtl_path,
         'meshes': len(meshes), 'vertices': total_verts_out, 'triangles': total_tris,
         'names': [m.name for m in meshes],
-        'textures_extracted': extracted, 'textures_expected': len(dds_wanted),
+        'textures_extracted': extracted,
+        'textures_expected': len(set(sm.texture_basename for sm in model.submeshes if sm.texture_basename)),
         'export_dir': model_dir,
     }
 
@@ -252,61 +201,22 @@ def export_model_with_textures(entry, output_dir: str,
 def export_pam_with_textures(entry, output_dir: str,
                               game_dir: str, progress_fn=None,
                               cached_entries=None) -> dict:
-    """Export PAM model as OBJ + MTL + DDS textures."""
-    from paz_unpack import extract_entry as paz_extract_entry
-
+    """Export PAM model as OBJ + MTL + DDS textures via TextureService."""
     pam_data = read_pam_bytes(entry)
     model_name = os.path.splitext(os.path.basename(entry.path))[0]
     model_dir = os.path.join(output_dir, model_name)
     tex_dir = os.path.join(model_dir, "textures")
     os.makedirs(tex_dir, exist_ok=True)
 
-    # Get texture names from submesh table
-    header = parse_pam_header(pam_data)
-    submeshes = parse_pam_submeshes(pam_data, header['mesh_count'])
+    # Parse to get texture names
+    model = PamParser().parse(pam_data)
+    dds_filenames = [sm.texture_basename + '.dds'
+                     for sm in model.submeshes if sm.texture_basename]
 
-    dds_wanted = set()
-    for sub in submeshes:
-        if sub.texture_name:
-            dds_wanted.add(sub.texture_name.lower())
-
-    # Extract DDS textures
-    if progress_fn:
-        progress_fn("Extracting textures...")
-
-    all_entries = cached_entries or []
-    available = set()
-    extracted = 0
-    for dds_name in dds_wanted:
-        matches = [e for e in all_entries
-                   if os.path.basename(e.path).lower() == dds_name]
-        for m in matches:
-            try:
-                paz_extract_entry(m, tex_dir, decrypt_xml=False)
-                nested = os.path.join(tex_dir, m.path.replace('/', os.sep))
-                flat = os.path.join(tex_dir, os.path.basename(m.path))
-                if os.path.exists(nested) and nested != flat:
-                    os.replace(nested, flat)
-                    try:
-                        d = os.path.dirname(nested)
-                        while d != tex_dir:
-                            os.rmdir(d)
-                            d = os.path.dirname(d)
-                    except OSError:
-                        pass
-                # Fix truncated DDS (streaming textures missing top mips)
-                flat = os.path.join(tex_dir, os.path.basename(m.path))
-                if os.path.exists(flat):
-                    with open(flat, 'rb') as df:
-                        dds_raw = df.read()
-                    fixed = fix_truncated_dds(dds_raw)
-                    if len(fixed) != len(dds_raw):
-                        with open(flat, 'wb') as df:
-                            df.write(fixed)
-                available.add(dds_name)
-                extracted += 1
-            except Exception:
-                pass
+    # Extract textures via TextureService
+    tex_svc = TextureService(game_dir, cached_entries=cached_entries)
+    available, extracted = tex_svc.extract_dds_files(dds_filenames, tex_dir,
+                                                     progress_fn=progress_fn)
 
     # Write OBJ + MTL
     if progress_fn:
@@ -315,7 +225,7 @@ def export_pam_with_textures(entry, output_dir: str,
     result = export_pam(pam_data, model_dir, name_hint=model_name,
                         texture_rel_dir="textures", available_textures=available)
     result['textures_extracted'] = extracted
-    result['textures_expected'] = len(dds_wanted)
+    result['textures_expected'] = len(set(dds_filenames))
     result['export_dir'] = model_dir
     return result
 

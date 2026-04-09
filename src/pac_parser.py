@@ -119,6 +119,16 @@ class PacParser:
 
     def parse(self, data: bytes, lods: list[int] | None = None) -> ParsedModel:
         header = self._parse_header(data)
+
+        # Detect still-compressed type 1 data
+        for i in range(8):
+            comp = struct.unpack_from('<I', data, 0x10 + i * 8)[0]
+            decomp = struct.unpack_from('<I', data, 0x10 + i * 8 + 4)[0]
+            if comp > 0 and decomp > 0:
+                raise ValueError(
+                    "PAC data has compressed sections (type 1). "
+                    "Call decompress_type1_pac(data, orig_size) before parse().")
+
         sec_by_idx = {s['index']: s for s in header['sections']}
 
         if 0 not in sec_by_idx:

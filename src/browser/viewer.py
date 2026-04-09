@@ -1,3 +1,4 @@
+import ctypes
 import math
 import numpy as np
 
@@ -6,7 +7,7 @@ from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
 
-from browser.models import GpuMesh
+from browser.models import GpuMesh, SceneMesh, SubmeshInfo, RenderMode
 
 
 # -- Orbit camera -----------------------------------------------------
@@ -112,9 +113,22 @@ void main() {
 }
 """
 
-FRAG_SRC = """#version 330 core
+VERT_UV_SRC = """#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec2 aUV;
+uniform mat4 uMVP;
+out vec3 vNormal;
+out vec2 vUV;
+void main() {
+    vNormal = aNormal;
+    vUV = aUV;
+    gl_Position = uMVP * vec4(aPos, 1.0);
+}
+"""
+
+FRAG_SOLID_SRC = """#version 330 core
 in vec3 vNormal;
-in vec3 vPos;
 out vec4 FragColor;
 uniform vec3 uLightDir;
 uniform vec3 uColor;
@@ -128,8 +142,58 @@ void main() {
 }
 """
 
+FRAG_WIREFRAME_SRC = """#version 330 core
+uniform vec3 uColor;
+out vec4 FragColor;
+void main() {
+    FragColor = vec4(uColor, 1.0);
+}
+"""
+
+FRAG_NORMALS_SRC = """#version 330 core
+in vec3 vNormal;
+out vec4 FragColor;
+void main() {
+    FragColor = vec4(abs(normalize(vNormal)), 1.0);
+}
+"""
+
+FRAG_UV_SRC = """#version 330 core
+in vec2 vUV;
+out vec4 FragColor;
+void main() {
+    float cx = floor(mod(vUV.x * 8.0, 2.0));
+    float cy = floor(mod(vUV.y * 8.0, 2.0));
+    float checker = mod(cx + cy, 2.0);
+    vec3 col = mix(vec3(0.25), vec3(0.85), checker);
+    FragColor = vec4(col, 1.0);
+}
+"""
+
 
 # -- 3D viewer widget -------------------------------------------------
+
+def _compile_program(vert_src, frag_src):
+    vs = glCreateShader(GL_VERTEX_SHADER)
+    glShaderSource(vs, vert_src)
+    glCompileShader(vs)
+    if not glGetShaderiv(vs, GL_COMPILE_STATUS):
+        raise RuntimeError(glGetShaderInfoLog(vs).decode())
+    fs = glCreateShader(GL_FRAGMENT_SHADER)
+    glShaderSource(fs, frag_src)
+    glCompileShader(fs)
+    if not glGetShaderiv(fs, GL_COMPILE_STATUS):
+        raise RuntimeError(glGetShaderInfoLog(fs).decode())
+    prog = glCreateProgram()
+    glAttachShader(prog, vs)
+    glAttachShader(prog, fs)
+    glLinkProgram(prog)
+    if not glGetProgramiv(prog, GL_LINK_STATUS):
+        raise RuntimeError(glGetProgramInfoLog(prog).decode())
+    glDeleteShader(vs)
+    glDeleteShader(fs)
+    return prog
+
 
 class ModelViewer(QOpenGLWidget):
     def __init__(self, parent=None):
@@ -141,19 +205,22 @@ class ModelViewer(QOpenGLWidget):
         super().__init__(parent)
         self.setFormat(fmt)
         self._camera = OrbitCamera()
-        self._program = 0
+        self._programs = {}
         self._vao = 0
         self._vbo_pos = 0
         self._vbo_nor = 0
+        self._vbo_uv = 0
         self._ebo = 0
         self._index_count = 0
         self._has_mesh = False
+        self._scene = None
+        self._render_mode = RenderMode.SOLID
 
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_MULTISAMPLE)
         glClearColor(0.10, 0.10, 0.18, 1.0)
-        self._compile_shaders()
+        self._compile_all_shaders()
         self._setup_buffers()
 
     def resizeGL(self, w, h):
@@ -163,31 +230,75 @@ class ModelViewer(QOpenGLWidget):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         if not self._has_mesh:
             return
+
         aspect = self.width() / max(self.height(), 1)
-        MVP = self._camera.proj_matrix(aspect) @ self._camera.view_matrix()
-        glUseProgram(self._program)
-        glUniformMatrix4fv(glGetUniformLocation(self._program, "uMVP"),
-                           1, GL_TRUE, MVP.astype(np.float32))
+        mvp = self._camera.proj_matrix(aspect) @ self._camera.view_matrix()
+        program = self._programs[self._render_mode]
+        glUseProgram(program)
+
+        glUniformMatrix4fv(glGetUniformLocation(program, "uMVP"),
+                           1, GL_TRUE, mvp.astype(np.float32))
         light = np.array([0.6, 0.8, 0.5], dtype=np.float32)
         light /= np.linalg.norm(light)
-        glUniform3fv(glGetUniformLocation(self._program, "uLightDir"), 1, light)
-        glUniform3f(glGetUniformLocation(self._program, "uColor"), 0.72, 0.72, 0.76)
+        light_loc = glGetUniformLocation(program, "uLightDir")
+        if light_loc >= 0:
+            glUniform3fv(light_loc, 1, light)
+
+        if self._render_mode == RenderMode.WIREFRAME:
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
+
         glBindVertexArray(self._vao)
-        glDrawElements(GL_TRIANGLES, self._index_count, GL_UNSIGNED_INT, None)
+
+        if self._scene is not None:
+            for sm in self._scene.submeshes:
+                if not sm.visible:
+                    continue
+                color_loc = glGetUniformLocation(program, "uColor")
+                if color_loc >= 0:
+                    glUniform3f(color_loc, *sm.base_color)
+                glDrawElements(GL_TRIANGLES, sm.index_count, GL_UNSIGNED_INT,
+                               ctypes.c_void_p(sm.index_offset))
+        else:
+            color_loc = glGetUniformLocation(program, "uColor")
+            if color_loc >= 0:
+                glUniform3f(color_loc, 0.72, 0.72, 0.76)
+            glDrawElements(GL_TRIANGLES, self._index_count, GL_UNSIGNED_INT, None)
+
         glBindVertexArray(0)
 
-    def load_mesh(self, mesh: GpuMesh):
+        if self._render_mode == RenderMode.WIREFRAME:
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+
+    def load_mesh(self, mesh):
+        """Accept GpuMesh (legacy) or SceneMesh (new)."""
         self.makeCurrent()
+
+        if isinstance(mesh, SceneMesh):
+            self._scene = mesh
+            positions = mesh.positions
+            normals = mesh.normals
+            uvs = mesh.uvs
+            indices = mesh.indices
+        else:
+            self._scene = None
+            positions = mesh.positions
+            normals = mesh.normals
+            uvs = np.zeros((len(positions), 2), dtype=np.float32)
+            indices = mesh.indices
+
         glBindBuffer(GL_ARRAY_BUFFER, self._vbo_pos)
-        glBufferData(GL_ARRAY_BUFFER, mesh.positions.nbytes,
-                     mesh.positions.tobytes(), GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, positions.nbytes,
+                     positions.tobytes(), GL_STATIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, self._vbo_nor)
-        glBufferData(GL_ARRAY_BUFFER, mesh.normals.nbytes,
-                     mesh.normals.tobytes(), GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, normals.nbytes,
+                     normals.tobytes(), GL_STATIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, self._vbo_uv)
+        glBufferData(GL_ARRAY_BUFFER, uvs.nbytes,
+                     uvs.tobytes(), GL_STATIC_DRAW)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self._ebo)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, mesh.indices.nbytes,
-                     mesh.indices.tobytes(), GL_STATIC_DRAW)
-        self._index_count = len(mesh.indices)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes,
+                     indices.tobytes(), GL_STATIC_DRAW)
+        self._index_count = len(indices)
         self._has_mesh = True
         self._camera.fit_to_sphere(mesh.center, mesh.radius)
         self.doneCurrent()
@@ -195,6 +306,11 @@ class ModelViewer(QOpenGLWidget):
 
     def clear_mesh(self):
         self._has_mesh = False
+        self._scene = None
+        self.update()
+
+    def set_render_mode(self, mode: RenderMode):
+        self._render_mode = mode
         self.update()
 
     def mousePressEvent(self, e):
@@ -208,39 +324,33 @@ class ModelViewer(QOpenGLWidget):
         self._camera.handle_scroll(e.angleDelta().y())
         self.update()
 
-    def _compile_shaders(self):
-        vs = glCreateShader(GL_VERTEX_SHADER)
-        glShaderSource(vs, VERT_SRC)
-        glCompileShader(vs)
-        if not glGetShaderiv(vs, GL_COMPILE_STATUS):
-            raise RuntimeError(glGetShaderInfoLog(vs).decode())
-        fs = glCreateShader(GL_FRAGMENT_SHADER)
-        glShaderSource(fs, FRAG_SRC)
-        glCompileShader(fs)
-        if not glGetShaderiv(fs, GL_COMPILE_STATUS):
-            raise RuntimeError(glGetShaderInfoLog(fs).decode())
-        self._program = glCreateProgram()
-        glAttachShader(self._program, vs)
-        glAttachShader(self._program, fs)
-        glLinkProgram(self._program)
-        if not glGetProgramiv(self._program, GL_LINK_STATUS):
-            raise RuntimeError(glGetProgramInfoLog(self._program).decode())
-        glDeleteShader(vs)
-        glDeleteShader(fs)
+    def _compile_all_shaders(self):
+        self._programs[RenderMode.SOLID] = _compile_program(VERT_SRC, FRAG_SOLID_SRC)
+        self._programs[RenderMode.WIREFRAME] = _compile_program(VERT_SRC, FRAG_WIREFRAME_SRC)
+        self._programs[RenderMode.NORMALS] = _compile_program(VERT_SRC, FRAG_NORMALS_SRC)
+        self._programs[RenderMode.UV] = _compile_program(VERT_UV_SRC, FRAG_UV_SRC)
 
     def _setup_buffers(self):
         self._vao = glGenVertexArrays(1)
-        self._vbo_pos, self._vbo_nor = glGenBuffers(2)
+        self._vbo_pos, self._vbo_nor, self._vbo_uv = glGenBuffers(3)
         self._ebo = glGenBuffers(1)
         glBindVertexArray(self._vao)
+
         glBindBuffer(GL_ARRAY_BUFFER, self._vbo_pos)
         glBufferData(GL_ARRAY_BUFFER, 0, None, GL_STATIC_DRAW)
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, None)
         glEnableVertexAttribArray(0)
+
         glBindBuffer(GL_ARRAY_BUFFER, self._vbo_nor)
         glBufferData(GL_ARRAY_BUFFER, 0, None, GL_STATIC_DRAW)
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 12, None)
         glEnableVertexAttribArray(1)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self._vbo_uv)
+        glBufferData(GL_ARRAY_BUFFER, 0, None, GL_STATIC_DRAW)
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8, None)
+        glEnableVertexAttribArray(2)
+
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self._ebo)
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, 0, None, GL_STATIC_DRAW)
         glBindVertexArray(0)

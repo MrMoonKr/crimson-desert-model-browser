@@ -14,7 +14,7 @@ from PySide6.QtGui import QAction
 
 from browser.settings import load_settings, save_settings, validate_game_dir
 from browser.models import (
-    CatalogEntry, GpuMesh, TrigramIndex, fuzzy_match,
+    CatalogEntry, ItemSearchEntry, GpuMesh, RenderMode, TrigramIndex, fuzzy_match,
     _SEPARATOR_SENTINEL, _ITEM_SECTION, _MODEL_SECTION,
     _ItemHeaderRow, _ItemChildRow,
 )
@@ -176,6 +176,30 @@ class BrowserWindow(QMainWindow):
         change_dir_action.triggered.connect(self._on_change_dir)
         file_menu.addAction(change_dir_action)
 
+        # View menu — render modes
+        view_menu = menubar.addMenu("View")
+        self._render_mode_actions = {}
+        shortcuts = {
+            RenderMode.SOLID: "1",
+            RenderMode.WIREFRAME: "2",
+            RenderMode.NORMALS: "3",
+            RenderMode.UV: "4",
+        }
+        for mode in RenderMode:
+            action = QAction(mode.name.capitalize(), self)
+            action.setCheckable(True)
+            action.setChecked(mode == RenderMode.SOLID)
+            if mode in shortcuts:
+                action.setShortcut(shortcuts[mode])
+            action.triggered.connect(lambda checked, m=mode: self._on_render_mode(m))
+            view_menu.addAction(action)
+            self._render_mode_actions[mode] = action
+
+    def _on_render_mode(self, mode: RenderMode):
+        self._viewer.set_render_mode(mode)
+        for m, action in self._render_mode_actions.items():
+            action.setChecked(m == mode)
+
     def _build_ui(self):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -269,20 +293,17 @@ class BrowserWindow(QMainWindow):
         # Item search index
         self._item_index = item_index
         self._pac_lookup = {e.filename: e for e in catalog}
-        self._list_model._pac_lookup = self._pac_lookup
+        self._list_model.set_pac_lookup(self._pac_lookup)
 
         # Build item name trigram index for fast search
         if item_index and item_index.items:
-            self._item_search_entries = []
-            for rec in item_index.items:
-                key = f"{rec.display_name} {rec.internal_name}".lower()
-                self._item_search_entries.append(
-                    CatalogEntry(filename="", display_name=rec.display_name,
-                                 paz_entry=None, search_key=key,
-                                 file_type="item", category=""))
-            # Attach record references for lookup
-            for entry, rec in zip(self._item_search_entries, item_index.items):
-                entry._item_record = rec
+            self._item_search_entries = [
+                ItemSearchEntry(
+                    search_key=f"{rec.display_name} {rec.internal_name}".lower(),
+                    record=rec,
+                )
+                for rec in item_index.items
+            ]
             self._item_trigram = TrigramIndex(self._item_search_entries)
         else:
             self._item_search_entries = []
@@ -336,7 +357,7 @@ class BrowserWindow(QMainWindow):
                 # Score by relevance: prefer items with PAC files, shorter names
                 scored = []
                 for entry in item_hits:
-                    rec = getattr(entry, '_item_record', None)
+                    rec = entry.record if isinstance(entry, ItemSearchEntry) else None
                     if rec and rec.pac_files:
                         # Lower score = better: items with models rank higher,
                         # shorter names rank higher (more specific match)

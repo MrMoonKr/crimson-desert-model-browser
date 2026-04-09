@@ -10,7 +10,8 @@ from browser.models import (
     _ItemHeaderRow, _ItemChildRow,
 )
 from item_db import build_item_index
-from paz_parse import parse_pamt, PazEntry
+from paz_parse import PazEntry
+from pamt_cache import parse_pamt_cached as parse_pamt
 
 
 DIR_CONFIG = {
@@ -82,6 +83,9 @@ class CatalogModel(QAbstractListModel):
         self._rows = []       # currently visible subset (lazy-loaded pages)
         self._show_tags = True
         self._pac_lookup: dict[str, CatalogEntry] = {}  # pac filename -> entry
+
+    def set_pac_lookup(self, lookup: dict):
+        self._pac_lookup = lookup
 
     _PAGE_SIZE = 500  # rows loaded per page
 

@@ -1,5 +1,6 @@
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum, auto
 
 
 @dataclass
@@ -13,12 +14,51 @@ class CatalogEntry:
 
 
 @dataclass
+class ItemSearchEntry:
+    """Item database record wrapped for search compatibility."""
+    search_key: str
+    record: object  # ItemRecord from item_db
+
+
+@dataclass
 class GpuMesh:
     positions: "np.ndarray"
     normals: "np.ndarray"
     indices: "np.ndarray"
     center: "np.ndarray"
     radius: float
+
+
+class RenderMode(Enum):
+    SOLID = auto()
+    WIREFRAME = auto()
+    NORMALS = auto()
+    UV = auto()
+
+
+@dataclass
+class SubmeshInfo:
+    name: str
+    material_name: str
+    index_offset: int     # byte offset into index buffer for glDrawElements
+    index_count: int
+    visible: bool = True
+    highlighted: bool = False
+    base_color: tuple = (0.72, 0.72, 0.76)
+
+
+@dataclass
+class SceneMesh:
+    """Rich mesh data for the viewer — replaces GpuMesh for new code."""
+    positions: "np.ndarray"    # (N, 3) float32
+    normals: "np.ndarray"      # (N, 3) float32
+    uvs: "np.ndarray"          # (N, 2) float32
+    indices: "np.ndarray"      # (M,) uint32
+    submeshes: list            # list[SubmeshInfo]
+    center: "np.ndarray"
+    radius: float
+    available_lods: list       # list[int]
+    current_lod: int = 0
 
 
 _SEPARATOR_SENTINEL = object()  # unique marker for separator rows

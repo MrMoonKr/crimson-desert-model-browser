@@ -38,9 +38,10 @@ def decode_pam_vertices(data, geom_off, byte_offset, count, bbox_min, bbox_max, 
     return verts
 
 
-def decode_pam_indices(data, byte_offset, count):
-    """Legacy wrapper returning list[int]."""
-    return [struct.unpack_from('<H', data, byte_offset + i * 2)[0] for i in range(count)]
+def decode_pam_indices(data, byte_offset, count, index_size=2):
+    """Legacy wrapper returning list[int]. Supports u16 (default) and u32."""
+    fmt = '<H' if index_size == 2 else '<I'
+    return [struct.unpack_from(fmt, data, byte_offset + i * index_size)[0] for i in range(count)]
 
 
 def export_pam(pam_data: bytes, output_dir: str, name_hint: str = "",

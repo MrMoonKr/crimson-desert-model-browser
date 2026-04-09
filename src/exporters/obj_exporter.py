@@ -102,6 +102,56 @@ def write_obj(meshes, obj_path: str, mtl_filename: str):
             f.write("\n")
 
 
+# ---- Fast numpy OBJ writer (for ParsedModel, skips Vertex intermediate) ----
+
+
+def write_obj_from_model(model: ParsedModel, obj_path: str, mtl_filename: str, lod: int = 0):
+    """Write OBJ directly from ParsedModel using numpy. Much faster for batch export."""
+    import io
+    import numpy as np
+
+    buf = io.StringIO()
+    buf.write(f"# Crimson Desert PAC export\nmtllib {mtl_filename}\n\n")
+
+    vert_offset = 0
+    for sm in model.submeshes:
+        geom = sm.get_geometry(lod)
+        if geom is None:
+            continue
+        vb, ib = geom
+        n = vb.count
+
+        buf.write(f"o {sm.name}\nusemtl {sm.material_name}\n")
+
+        # Positions
+        pos_buf = io.BytesIO()
+        np.savetxt(pos_buf, vb.positions, fmt='v %.6f %.6f %.6f')
+        buf.write(pos_buf.getvalue().decode())
+
+        # Normals
+        nor_buf = io.BytesIO()
+        np.savetxt(nor_buf, vb.normals, fmt='vn %.6f %.6f %.6f')
+        buf.write(nor_buf.getvalue().decode())
+
+        # UVs with V-flip
+        uvs_flipped = vb.uvs.copy()
+        uvs_flipped[:, 1] = 1.0 - uvs_flipped[:, 1]
+        uv_buf = io.BytesIO()
+        np.savetxt(uv_buf, uvs_flipped, fmt='vt %.6f %.6f')
+        buf.write(uv_buf.getvalue().decode())
+
+        # Faces
+        tri = ib.indices.reshape(-1, 3).astype(np.int64) + vert_offset + 1
+        for a, b, c in tri:
+            buf.write(f"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}\n")
+
+        vert_offset += n
+        buf.write("\n")
+
+    with open(obj_path, 'w') as f:
+        f.write(buf.getvalue())
+
+
 # ---- Plugin class ----
 
 
