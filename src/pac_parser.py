@@ -19,7 +19,7 @@ try:
 except ImportError:
     HAS_LZ4 = False
 
-from model_types import ParsedModel, SubMesh, VertexBuffer, IndexBuffer, BoundingBox, SourceFormat
+from model_types import ParsedModel, SubMesh, VertexBuffer, IndexBuffer, BoundingBox, SourceFormat, Bone
 from pac_decode import decode_pac_vertices, decode_indices, PAC_STRIDE
 
 
@@ -177,6 +177,9 @@ class PacParser:
         for sm in all_submeshes[1:]:
             bbox = bbox.union(sm.bbox)
 
+        # Parse bones from section 0 (Format 1: named bones only)
+        bones = self._parse_bones(data, sec0, descriptors, warnings)
+
         return ParsedModel(
             source_format=SourceFormat.PAC,
             format_version=header['version'],
@@ -184,6 +187,7 @@ class PacParser:
             bbox=bbox,
             warnings=warnings,
             sections=header['sections'],
+            bones=bones,
             raw_size=len(data),
             lod_count=len(available_lods),
             available_lods=available_lods,
@@ -503,3 +507,101 @@ class PacParser:
             idx_byte_cursor += ic * 2
 
         return submeshes, warnings
+
+    def _parse_bones(self, data: bytes, sec0: dict, descriptors: list,
+                     warnings: list) -> list[Bone] | None:
+        """Parse bone hierarchy from section 0 (Format 1: named bones only).
+
+        Format 1 is detected by sec0[0] & 0x01 (weapons, chains, attachments).
+        Format 2 (body/armor, ~85% of files) stores compact unnamed entries —
+        the actual skeleton lives in external skeleton definition files.
+        """
+        sec0_off = sec0['offset']
+        sec0_data = data[sec0_off:sec0_off + sec0['size']]
+
+        # Only Format 1 has named bones
+        if not (sec0_data[0] & 0x01):
+            return None
+
+        # Find end of last mesh descriptor
+        desc_sizes = {4: 64, 3: 58, 2: 52}
+        last_end = 0
+        for desc in descriptors:
+            desc_size = desc_sizes.get(desc.attr_count, 64)
+            end = desc.section0_offset + desc_size
+            if end > last_end:
+                last_end = end
+
+        off = last_end
+        if off + 4 >= len(sec0_data):
+            return None
+
+        # Read bone count (u32 for Format 1)
+        bone_count = struct.unpack_from('<I', sec0_data, off)[0]
+        off += 4
+
+        if bone_count == 0 or bone_count > 1000:
+            return None
+
+        bones = []
+        try:
+            for _ in range(bone_count):
+                if off + 5 > len(sec0_data):
+                    break
+                _hash = struct.unpack_from('<I', sec0_data, off)[0]
+                off += 4
+                name_len = sec0_data[off]
+                off += 1
+                if off + name_len > len(sec0_data):
+                    break
+                # Validate name is ASCII printable
+                name_bytes = sec0_data[off:off + name_len]
+                if not all(32 <= b < 127 for b in name_bytes):
+                    break
+                name = name_bytes.decode('ascii')
+                off += name_len
+                if off + 4 + 256 + 40 > len(sec0_data):
+                    break
+                parent_idx = struct.unpack_from('<i', sec0_data, off)[0]
+                off += 4
+
+                # 4 matrices: world, inv_world, local, inv_local (each 4x4 float32)
+                world = np.frombuffer(sec0_data, dtype='<f4', count=16,
+                                      offset=off).reshape(4, 4).copy()
+                off += 64
+                inv_world = np.frombuffer(sec0_data, dtype='<f4', count=16,
+                                          offset=off).reshape(4, 4).copy()
+                off += 64
+                local = np.frombuffer(sec0_data, dtype='<f4', count=16,
+                                      offset=off).reshape(4, 4).copy()
+                off += 64
+                _inv_local = np.frombuffer(sec0_data, dtype='<f4', count=16,
+                                           offset=off).reshape(4, 4).copy()
+                off += 64
+
+                # Decomposed transform: scale(3) + quaternion(4) + position(3)
+                scale = np.frombuffer(sec0_data, dtype='<f4', count=3,
+                                      offset=off).copy()
+                off += 12
+                quat = np.frombuffer(sec0_data, dtype='<f4', count=4,
+                                     offset=off).copy()
+                off += 16
+                pos = np.frombuffer(sec0_data, dtype='<f4', count=3,
+                                    offset=off).copy()
+                off += 12
+
+                bones.append(Bone(
+                    name=name,
+                    parent_index=parent_idx,
+                    inverse_bind_matrix=inv_world,
+                    local_matrix=local,
+                    position=pos,
+                    rotation=quat,
+                    scale=scale,
+                ))
+        except Exception:
+            if not bones:
+                return None
+            warnings.append(f"Bone parsing stopped after {len(bones)}/{bone_count} bones")
+
+        return bones if bones else None

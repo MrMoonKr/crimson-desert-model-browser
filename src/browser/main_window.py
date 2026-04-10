@@ -27,16 +27,44 @@ from item_db import ItemIndex, ItemRecord
 # ── Export dialog ────────────────────────────────────────────────────
 
 class ExportDialog(QDialog):
-    """Export dialog with path selector and dye color option."""
+    """Export dialog with format selector, path selector, and dye color option."""
 
-    def __init__(self, default_dir: str = "", parent=None):
+    _FORMAT_OPTIONS = [
+        ("fbx", "FBX — mesh, materials, textures, tangents, skeleton"),
+        ("gltf", "glTF — mesh, materials, textures, tangents, skeleton"),
+        ("obj", "OBJ + MTL — mesh, materials, textures"),
+    ]
+
+    def __init__(self, default_dir: str = "", default_format: str = "fbx",
+                 parent=None):
         super().__init__(parent)
         self.setWindowTitle("Export Model")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(500)
 
         layout = QVBoxLayout(self)
 
+        # Format selector
+        fmt_label = QLabel("Format")
+        fmt_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(fmt_label)
+
+        self._format_combo = QComboBox()
+        for fmt_id, desc in self._FORMAT_OPTIONS:
+            self._format_combo.addItem(desc, fmt_id)
+        # Set default
+        for i, (fmt_id, _) in enumerate(self._FORMAT_OPTIONS):
+            if fmt_id == default_format:
+                self._format_combo.setCurrentIndex(i)
+                break
+        self._format_combo.setStyleSheet("padding: 4px; font-size: 12px;")
+        layout.addWidget(self._format_combo)
+        layout.addSpacing(12)
+
         # Path selector row
+        path_label = QLabel("Output directory")
+        path_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(path_label)
+
         path_row = QHBoxLayout()
         self._path_edit = QLineEdit(default_dir)
         self._path_edit.setPlaceholderText("Export directory...")
@@ -45,18 +73,18 @@ class ExportDialog(QDialog):
         path_row.addWidget(self._path_edit, 1)
         path_row.addWidget(browse_btn)
         layout.addLayout(path_row)
-        layout.addSpacing(8)
+        layout.addSpacing(12)
 
         # Dye color checkbox
         self._dye_check = QCheckBox("Apply default dye colors")
         layout.addWidget(self._dye_check)
 
-        # Hint text (indented under checkbox, tight spacing)
         hint = QLabel("Export raw color mask or apply default in-game dye colors to mesh textures")
         hint.setStyleSheet("color: gray; font-size: 11px; margin-top: -2px;")
         hint.setWordWrap(True)
         hint.setContentsMargins(22, 0, 0, 0)
         layout.addWidget(hint)
+        layout.addSpacing(8)
 
         # Export button
         export_btn = QPushButton("Export")
@@ -71,6 +99,9 @@ class ExportDialog(QDialog):
 
     def output_dir(self) -> str:
         return self._path_edit.text().strip()
+
+    def export_format(self) -> str:
+        return self._format_combo.currentData()
 
     def apply_dye_colors(self) -> bool:
         return self._dye_check.isChecked()
@@ -478,8 +509,11 @@ class BrowserWindow(QMainWindow):
     def _on_export(self):
         if not self._current_entry:
             return
-        last_dir = load_settings().get("export_dir", "")
-        dlg = ExportDialog(default_dir=last_dir, parent=self)
+        settings = load_settings()
+        last_dir = settings.get("export_dir", "")
+        last_fmt = settings.get("export_format", "fbx")
+        dlg = ExportDialog(default_dir=last_dir, default_format=last_fmt,
+                           parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
         output_dir = dlg.output_dir()
@@ -487,13 +521,16 @@ class BrowserWindow(QMainWindow):
             return
         save_settings(export_dir=output_dir)
 
+        export_format = dlg.export_format()
+        save_settings(export_format=export_format)
         self._export_action.setEnabled(False)
-        self.statusBar().showMessage("Exporting...")
+        self.statusBar().showMessage(f"Exporting ({export_format.upper()})...")
 
         self._export_worker = ExportWorker(
             self._current_entry, output_dir, self._game_dir,
             cached_entries=self._all_entries,
-            apply_dye_colors=dlg.apply_dye_colors(), parent=self)
+            apply_dye_colors=dlg.apply_dye_colors(),
+            export_format=export_format, parent=self)
         self._export_worker.progress.connect(self.statusBar().showMessage)
         self._export_worker.export_done.connect(self._on_export_done)
         self._export_worker.export_error.connect(self._on_export_error)
@@ -504,8 +541,9 @@ class BrowserWindow(QMainWindow):
         tex = result.get('textures_extracted', 0)
         tex_total = result.get('textures_expected', 0)
         path = result.get('export_dir', '')
+        fmt = result.get('format', 'obj').upper()
         self.statusBar().showMessage(
-            f"Exported to {path} — {result['vertices']} verts, "
+            f"Exported {fmt} to {path} — {result['vertices']} verts, "
             f"{result['triangles']} tris, {tex}/{tex_total} textures")
 
     def _on_export_error(self, msg):

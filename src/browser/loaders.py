@@ -134,13 +134,14 @@ def load_pam_mesh(entry) -> SceneMesh:
     return _model_to_scene_mesh(model)
 
 
-# ── Export (OBJ + MTL + DDS textures) ─────────────────────────────
+# ── Export (mesh + materials + DDS textures) ─────────────────────
 
 def export_model_with_textures(entry, output_dir: str,
                                game_dir: str, progress_fn=None,
                                cached_entries=None,
-                               apply_dye_colors: bool = False) -> dict:
-    """Export PAC model as OBJ + MTL + DDS textures via TextureService."""
+                               apply_dye_colors: bool = False,
+                               export_format: str = 'fbx') -> dict:
+    """Export PAC model with textures. Format: 'fbx', 'gltf', or 'obj'."""
     pac_data = read_pac_bytes(entry)
     model_name = os.path.splitext(os.path.basename(entry.path))[0]
     model_dir = os.path.join(output_dir, model_name)
@@ -162,9 +163,9 @@ def export_model_with_textures(entry, output_dir: str,
         diffuse_overrides = tex_svc.apply_dye_colors(model_name, submesh_pairs,
                                                       tex_dir, progress_fn=progress_fn)
 
-    # Write OBJ + MTL via exporter
+    # Export via selected format
     if progress_fn:
-        progress_fn("Writing OBJ + MTL...")
+        progress_fn(f"Writing {export_format.upper()}...")
 
     options = ExportOptions(
         name_hint=model_name,
@@ -172,11 +173,10 @@ def export_model_with_textures(entry, output_dir: str,
         available_textures=available,
         diffuse_overrides=diffuse_overrides,
     )
-    result = get_exporter('obj').export_to_disk(model, model_dir, options)
+    result = get_exporter(export_format).export_to_disk(model, model_dir, options)
 
     return {
-        'obj': result.output_files[0],
-        'mtl': result.output_files[1],
+        'output_files': result.output_files,
         'meshes': result.stats['meshes'],
         'vertices': result.stats['vertices'],
         'triangles': result.stats['triangles'],
@@ -184,20 +184,21 @@ def export_model_with_textures(entry, output_dir: str,
         'textures_extracted': extracted,
         'textures_expected': len(set(sm.texture_basename for sm in model.submeshes if sm.texture_basename)),
         'export_dir': model_dir,
+        'format': export_format,
     }
 
 
 def export_pam_with_textures(entry, output_dir: str,
                               game_dir: str, progress_fn=None,
-                              cached_entries=None) -> dict:
-    """Export PAM model as OBJ + MTL + DDS textures via TextureService."""
+                              cached_entries=None,
+                              export_format: str = 'fbx') -> dict:
+    """Export PAM model with textures. Format: 'fbx', 'gltf', or 'obj'."""
     pam_data = read_pam_bytes(entry)
     model_name = os.path.splitext(os.path.basename(entry.path))[0]
     model_dir = os.path.join(output_dir, model_name)
     tex_dir = os.path.join(model_dir, "textures")
     os.makedirs(tex_dir, exist_ok=True)
 
-    # Parse once — used for both texture extraction and OBJ export
     model = PamParser().parse(pam_data)
     dds_filenames = [sm.texture_basename + '.dds'
                      for sm in model.submeshes if sm.texture_basename]
@@ -207,20 +208,19 @@ def export_pam_with_textures(entry, output_dir: str,
     available, extracted = tex_svc.extract_dds_files(dds_filenames, tex_dir,
                                                      progress_fn=progress_fn)
 
-    # Write OBJ + MTL via exporter (reuses parsed model, no double-parse)
+    # Export via selected format
     if progress_fn:
-        progress_fn("Writing OBJ + MTL...")
+        progress_fn(f"Writing {export_format.upper()}...")
 
     options = ExportOptions(
         name_hint=model_name,
         texture_rel_dir="textures",
         available_textures=available,
     )
-    result = get_exporter('obj').export_to_disk(model, model_dir, options)
+    result = get_exporter(export_format).export_to_disk(model, model_dir, options)
 
     return {
-        'obj': result.output_files[0],
-        'mtl': result.output_files[1],
+        'output_files': result.output_files,
         'meshes': result.stats['meshes'],
         'vertices': result.stats['vertices'],
         'triangles': result.stats['triangles'],
@@ -228,6 +228,7 @@ def export_pam_with_textures(entry, output_dir: str,
         'textures_extracted': extracted,
         'textures_expected': len(set(dds_filenames)),
         'export_dir': model_dir,
+        'format': export_format,
     }
 
 
@@ -258,13 +259,14 @@ class ExportWorker(QThread):
     progress = Signal(str)
 
     def __init__(self, entry, output_dir, game_dir, cached_entries=None,
-                 apply_dye_colors=False, parent=None):
+                 apply_dye_colors=False, export_format='fbx', parent=None):
         super().__init__(parent)
         self._entry = entry
         self._output_dir = output_dir
         self._game_dir = game_dir
         self._cached_entries = cached_entries
         self._apply_dye_colors = apply_dye_colors
+        self._export_format = export_format
 
     def run(self):
         try:
@@ -272,13 +274,15 @@ class ExportWorker(QThread):
                 result = export_pam_with_textures(
                     self._entry.paz_entry, self._output_dir,
                     self._game_dir, progress_fn=self.progress.emit,
-                    cached_entries=self._cached_entries)
+                    cached_entries=self._cached_entries,
+                    export_format=self._export_format)
             else:
                 result = export_model_with_textures(
                     self._entry.paz_entry, self._output_dir,
                     self._game_dir, progress_fn=self.progress.emit,
                     cached_entries=self._cached_entries,
-                    apply_dye_colors=self._apply_dye_colors)
+                    apply_dye_colors=self._apply_dye_colors,
+                    export_format=self._export_format)
             self.export_done.emit(result)
         except Exception as e:
             self.export_error.emit(str(e))

@@ -43,6 +43,9 @@ class VertexBuffer:
     positions: np.ndarray   # (N, 3) float32
     normals: np.ndarray     # (N, 3) float32
     uvs: np.ndarray         # (N, 2) float32 — raw game UVs, no V-flip
+    tangents: Optional[np.ndarray] = None      # (N, 4) float32 — xyz + handedness w
+    bone_indices: Optional[np.ndarray] = None  # (N, 8) uint16 — 4 from set A + 4 from set B
+    bone_weights: Optional[np.ndarray] = None  # (N, 8) float32 — normalized to sum=1
 
     @property
     def count(self) -> int:
@@ -56,6 +59,17 @@ class IndexBuffer:
     @property
     def count(self) -> int:
         return len(self.indices)
+
+
+@dataclass
+class Bone:
+    name: str
+    parent_index: int                       # -1 = root
+    inverse_bind_matrix: np.ndarray         # (4, 4) float32 — for skinning
+    local_matrix: np.ndarray                # (4, 4) float32 — local-space transform
+    position: np.ndarray                    # (3,) float32
+    rotation: np.ndarray                    # (4,) float32 — quaternion XYZW
+    scale: np.ndarray                       # (3,) float32
 
 
 @dataclass
