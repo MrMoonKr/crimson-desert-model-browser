@@ -15,13 +15,13 @@ from PySide6.QtGui import QAction
 from browser.settings import load_settings, save_settings, validate_game_dir
 from browser.models import (
     CatalogEntry, ItemSearchEntry, GpuMesh, RenderMode, TrigramIndex, fuzzy_match,
-    _SEPARATOR_SENTINEL, _ITEM_SECTION, _MODEL_SECTION,
-    _ItemHeaderRow, _ItemChildRow,
+    _SEPARATOR_SENTINEL, _ITEM_SECTION, _CHAR_SECTION, _MODEL_SECTION,
+    _ItemHeaderRow, _ItemChildRow, _CharHeaderRow,
 )
 from browser.catalog import CatalogModel, SeparatorDelegate, CatalogWorker
 from browser.loaders import LoadWorker, ExportWorker
 from browser.viewer import ModelViewer
-from item_db import ItemIndex, ItemRecord
+from item_db import ItemIndex, ItemRecord, CharacterIndex, CharacterRecord
 
 
 # ── Export dialog ────────────────────────────────────────────────────
@@ -177,11 +177,14 @@ class BrowserWindow(QMainWindow):
         self._game_dir = game_dir
         self._catalog: list[CatalogEntry] = []
         self._all_entries: list = []  # cached PAMT for fast texture export
-        self._filtered: list[CatalogEntry] = []
+        self._is_filtered = False
         self._trigram_index: TrigramIndex | None = None
         self._item_index: ItemIndex | None = None
         self._item_trigram: TrigramIndex | None = None
         self._item_search_entries: list = []
+        self._char_index: CharacterIndex | None = None
+        self._char_trigram: TrigramIndex | None = None
+        self._char_search_entries: list = []
         self._pac_lookup: dict[str, CatalogEntry] = {}
         self._load_worker: LoadWorker | None = None
         self._export_worker: ExportWorker | None = None
@@ -314,12 +317,12 @@ class BrowserWindow(QMainWindow):
         self._cat_worker.failed.connect(self._on_catalog_failed)
         self._cat_worker.start()
 
-    def _on_catalog_ready(self, catalog, all_entries, item_index):
+    def _on_catalog_ready(self, catalog, all_entries, item_index, char_index):
         self._catalog = catalog
         self._all_entries = all_entries
         self._category_subset = catalog
         self._trigram_index = TrigramIndex(catalog)
-        self._filtered = catalog
+        # Count labels use model.match_count() + model.total_row_count()
 
         # Item search index
         self._item_index = item_index
@@ -340,10 +343,24 @@ class BrowserWindow(QMainWindow):
             self._item_search_entries = []
             self._item_trigram = None
 
+        # Build character appearance trigram index
+        self._char_index = char_index
+        if char_index and char_index.characters:
+            from browser.models import ItemSearchEntry as _SE
+            self._char_search_entries = [
+                _SE(search_key=rec.search_key, record=rec)
+                for rec in char_index.characters
+            ]
+            self._char_trigram = TrigramIndex(self._char_search_entries)
+        else:
+            self._char_search_entries = []
+            self._char_trigram = None
+
         self._list_model.set_items(catalog, show_tags=True)
         pac_count = sum(1 for e in catalog if e.file_type == "pac")
         pam_count = sum(1 for e in catalog if e.file_type == "pam")
         item_count = len(item_index.items) if item_index else 0
+        char_count = len(char_index.characters) if char_index else 0
         self._count_label.setText(f"{len(catalog):,} models")
         self._search.setEnabled(True)
         self._category_filter.setEnabled(True)
@@ -352,6 +369,8 @@ class BrowserWindow(QMainWindow):
         msg = f"Loaded {pac_count:,} PAC + {pam_count:,} PAM = {len(catalog):,} models"
         if item_count:
             msg += f" + {item_count:,} items"
+        if char_count:
+            msg += f" + {char_count:,} characters"
         self.statusBar().showMessage(msg)
 
     def _on_catalog_failed(self, msg):
@@ -380,18 +399,34 @@ class BrowserWindow(QMainWindow):
 
         if key:
             terms = key.split()
+            category = self._category_filter.currentText().lower()
+            # Character/item groups only shown for "all" or "characters" categories
+            show_grouped = category in ("all", "characters")
+
+            # Search character appearances (app.xml)
+            char_rows = []
+            if show_grouped and self._char_trigram and len(key) >= 3:
+                char_hits = self._char_trigram.multi_term_matches(terms)
+                scored = []
+                for entry in char_hits:
+                    rec = entry.record
+                    if rec and rec.pac_files:
+                        scored.append((len(rec.app_name), rec))
+                scored.sort(key=lambda x: x[0])
+                for _, rec in scored:
+                    char_rows.append(_CharHeaderRow(
+                        display_label=rec.display_label,
+                        app_name=rec.app_name,
+                        pac_files=rec.pac_files))
 
             # Search item names (display name + internal name)
             item_rows = []
-            if self._item_trigram and len(key) >= 3:
+            if show_grouped and self._item_trigram and len(key) >= 3:
                 item_hits = self._item_trigram.multi_term_matches(terms)
-                # Score by relevance: prefer items with PAC files, shorter names
                 scored = []
                 for entry in item_hits:
                     rec = entry.record if isinstance(entry, ItemSearchEntry) else None
                     if rec and rec.pac_files:
-                        # Lower score = better: items with models rank higher,
-                        # shorter names rank higher (more specific match)
                         scored.append((len(rec.display_name), rec))
                 scored.sort(key=lambda x: x[0])
                 for _, rec in scored:
@@ -417,31 +452,29 @@ class BrowserWindow(QMainWindow):
                 fuzzy.sort(key=lambda x: -x[0])
                 fuzzy_entries = [e for _, e in fuzzy]
 
-            count = len(exact) + len(fuzzy_entries)
-            self._filtered = exact + fuzzy_entries
-
-            if item_rows:
+            if char_rows or item_rows:
                 self._list_model.set_search_results(
-                    item_rows, exact, fuzzy_entries, show_tags=show_tags)
+                    item_rows, char_rows, exact, fuzzy_entries,
+                    show_tags=show_tags)
             else:
                 self._list_model.set_results(exact, fuzzy_entries, show_tags=show_tags)
+
         else:
-            self._filtered = subset
-            count = len(subset)
             self._list_model.set_items(subset, show_tags=show_tags)
 
+        self._is_filtered = bool(key) or self._category_filter.currentText() != "All"
+        self._update_count_label()
+
+    def _update_count_label(self):
+        """Update status bar count from model state."""
+        count = self._list_model.match_count()
         displayed = self._list_model.rowCount()
-        is_filtered = key or self._category_filter.currentText() != "All"
-        if is_filtered:
-            if displayed < count:
-                label = f"{count:,} matches (showing {displayed:,})"
-            else:
-                label = f"{count:,} matches"
+        total_rows = self._list_model.total_row_count()
+        word = "matches" if self._is_filtered else "models"
+        if displayed < total_rows:
+            label = f"{count:,} {word} (showing {displayed:,})"
         else:
-            if displayed < count:
-                label = f"{count:,} models (showing {displayed:,})"
-            else:
-                label = f"{count:,} models"
+            label = f"{count:,} {word}"
         self._count_label.setText(label)
         self.statusBar().showMessage(label)
 
@@ -451,14 +484,7 @@ class BrowserWindow(QMainWindow):
         if sb.maximum() > 0 and value >= sb.maximum() - 50:
             if self._list_model.can_load_more():
                 self._list_model.load_more()
-                # Update count label
-                count = len(self._filtered)
-                displayed = self._list_model.rowCount()
-                if displayed < count:
-                    label = f"{count:,} matches (showing {displayed:,})"
-                else:
-                    label = f"{count:,} matches"
-                self._count_label.setText(label)
+                self._update_count_label()
 
     def _on_selection(self, index):
         if not index.isValid():
@@ -476,6 +502,17 @@ class BrowserWindow(QMainWindow):
                     self._load_model(cat_entry)
                     self._info_strip.setText(
                         f"{entry.display_name}  ({len(entry.pac_files)} model files)")
+            return
+        # Character header click -- preview first PAC file
+        if isinstance(entry, _CharHeaderRow):
+            if entry.pac_files:
+                cat_entry = self._pac_lookup.get(entry.pac_files[0])
+                if cat_entry:
+                    self._current_entry = cat_entry
+                    self._export_action.setEnabled(True)
+                    self._load_model(cat_entry)
+                    self._info_strip.setText(
+                        f"{entry.display_label}  ({len(entry.pac_files)} model files)")
             return
         self._current_entry = entry
         self._export_action.setEnabled(True)

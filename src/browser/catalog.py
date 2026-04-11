@@ -6,10 +6,10 @@ from PySide6.QtGui import QFont, QColor
 
 from browser.models import (
     CatalogEntry, GpuMesh,
-    _SEPARATOR_SENTINEL, _ITEM_SECTION, _MODEL_SECTION,
-    _ItemHeaderRow, _ItemChildRow,
+    _SEPARATOR_SENTINEL, _ITEM_SECTION, _CHAR_SECTION, _MODEL_SECTION,
+    _ItemHeaderRow, _ItemChildRow, _CharHeaderRow,
 )
-from item_db import build_item_index
+from item_db import build_item_index, build_character_index, build_prefab_pac_map
 from paz_parse import PazEntry
 from pamt_cache import parse_pamt_cached as parse_pamt
 
@@ -42,8 +42,8 @@ def build_catalog(game_dir: str, progress_fn=None) -> tuple[list[CatalogEntry], 
 
         entries = parse_pamt(pamt_path, paz_dir=sub_dir)
 
-        # Cache mesh, texture, prefab, and pac.xml entries
-        useful_exts = extensions | {".dds", ".prefab", ".pac.xml"}
+        # Cache mesh, texture, prefab, appearance, and pac.xml entries
+        useful_exts = extensions | {".dds", ".prefab", ".pac.xml", ".app.xml"}
         for e in entries:
             lower = e.path.lower()
             if any(lower.endswith(ext) for ext in useful_exts):
@@ -81,6 +81,7 @@ class CatalogModel(QAbstractListModel):
         super().__init__(parent)
         self._all_rows = []   # full result set
         self._rows = []       # currently visible subset (lazy-loaded pages)
+        self._match_count = 0 # actual search hits (headers + model entries, not children/sentinels)
         self._show_tags = True
         self._pac_lookup: dict[str, CatalogEntry] = {}  # pac filename -> entry
 
@@ -93,6 +94,7 @@ class CatalogModel(QAbstractListModel):
         """Set search results with optional separator between groups."""
         self.beginResetModel()
         self._show_tags = show_tags
+        self._match_count = len(exact) + len(fuzzy)
         self._all_rows = list(exact)
         if exact and fuzzy:
             self._all_rows.append(_SEPARATOR_SENTINEL)
@@ -104,49 +106,86 @@ class CatalogModel(QAbstractListModel):
         """Set plain item list (no separator)."""
         self.beginResetModel()
         self._show_tags = show_tags
+        self._match_count = len(items)
         self._all_rows = list(items)
         self._rows = self._all_rows[:self._PAGE_SIZE]
         self.endResetModel()
 
+    def _resolve_pac_children(self, pac_files: list) -> list[_ItemChildRow]:
+        """Resolve pac filenames to catalog entries, return child rows."""
+        children = []
+        for pac_name in pac_files:
+            entry = self._pac_lookup.get(pac_name)
+            if entry:
+                children.append(entry)
+            else:
+                base = pac_name.replace('.pac', '')
+                for sfx in ('_l.pac', '_r.pac', '_sub01.pac'):
+                    e = self._pac_lookup.get(base + sfx)
+                    if e and e not in children:
+                        children.append(e)
+        return [_ItemChildRow(catalog_entry=e, is_last=(i == len(children) - 1))
+                for i, e in enumerate(children)]
+
     def set_search_results(self, item_rows: list[_ItemHeaderRow],
+                           char_rows: list[_CharHeaderRow],
                            model_exact: list, model_fuzzy: list,
                            show_tags: bool = True):
-        """Set combined item + model search results."""
+        """Set combined item + character + model search results."""
         self.beginResetModel()
         self._show_tags = show_tags
         self._all_rows = []
+        hits = 0
+        has_grouped = False
+
+        if char_rows:
+            filtered = []
+            for header in char_rows:
+                children = self._resolve_pac_children(header.pac_files)
+                if children:
+                    filtered.append((header, children))
+            if filtered:
+                has_grouped = True
+                hits += len(filtered)
+                self._all_rows.append(_CHAR_SECTION)
+                for header, children in filtered:
+                    self._all_rows.append(header)
+                    self._all_rows.extend(children)
 
         if item_rows:
-            self._all_rows.append(_ITEM_SECTION)
+            filtered = []
             for header in item_rows:
-                self._all_rows.append(header)
-                children = []
-                for pac_name in header.pac_files:
-                    # Try exact match, then _l/_r variants
-                    entry = self._pac_lookup.get(pac_name)
-                    if entry:
-                        children.append(entry)
-                    else:
-                        base = pac_name.replace('.pac', '')
-                        for sfx in ('_l.pac', '_r.pac', '_sub01.pac'):
-                            e = self._pac_lookup.get(base + sfx)
-                            if e and e not in children:
-                                children.append(e)
-                for i, entry in enumerate(children):
-                    self._all_rows.append(_ItemChildRow(
-                        catalog_entry=entry,
-                        is_last=(i == len(children) - 1)))
+                children = self._resolve_pac_children(header.pac_files)
+                if children:
+                    filtered.append((header, children))
+            if filtered:
+                has_grouped = True
+                hits += len(filtered)
+                self._all_rows.append(_ITEM_SECTION)
+                for header, children in filtered:
+                    self._all_rows.append(header)
+                    self._all_rows.extend(children)
 
+        hits += len(model_exact) + len(model_fuzzy)
         if model_exact or model_fuzzy:
-            if item_rows:
+            if has_grouped:
                 self._all_rows.append(_MODEL_SECTION)
             self._all_rows.extend(model_exact)
             if model_exact and model_fuzzy:
                 self._all_rows.append(_SEPARATOR_SENTINEL)
             self._all_rows.extend(model_fuzzy)
 
+        self._match_count = hits
         self._rows = self._all_rows[:self._PAGE_SIZE]
         self.endResetModel()
+
+    def match_count(self) -> int:
+        """Actual search hits (headers + model entries, not children/sentinels)."""
+        return self._match_count
+
+    def total_row_count(self) -> int:
+        """Total rows including not-yet-paged ones (for paging logic)."""
+        return len(self._all_rows)
 
     def can_load_more(self) -> bool:
         return len(self._rows) < len(self._all_rows)
@@ -174,6 +213,8 @@ class CatalogModel(QAbstractListModel):
             return "\u2500  closest matches  \u2500" if role == Qt.ItemDataRole.DisplayRole else None
         if item is _ITEM_SECTION:
             return "ITEMS" if role == Qt.ItemDataRole.DisplayRole else None
+        if item is _CHAR_SECTION:
+            return "CHARACTERS" if role == Qt.ItemDataRole.DisplayRole else None
         if item is _MODEL_SECTION:
             return "MODELS" if role == Qt.ItemDataRole.DisplayRole else None
 
@@ -181,6 +222,14 @@ class CatalogModel(QAbstractListModel):
         if isinstance(item, _ItemHeaderRow):
             if role == Qt.ItemDataRole.DisplayRole:
                 return f"  {item.display_name}  ({item.internal_name})"
+            if role == Qt.ItemDataRole.UserRole:
+                return item
+            return None
+
+        # Character header row
+        if isinstance(item, _CharHeaderRow):
+            if role == Qt.ItemDataRole.DisplayRole:
+                return f"  {item.display_label}  ({item.app_name})"
             if role == Qt.ItemDataRole.UserRole:
                 return item
             return None
@@ -208,9 +257,9 @@ class CatalogModel(QAbstractListModel):
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
         item = self._rows[index.row()]
-        if item in (_SEPARATOR_SENTINEL, _ITEM_SECTION, _MODEL_SECTION):
+        if item in (_SEPARATOR_SENTINEL, _ITEM_SECTION, _CHAR_SECTION, _MODEL_SECTION):
             return Qt.ItemFlag.NoItemFlags
-        if isinstance(item, _ItemHeaderRow):
+        if isinstance(item, (_ItemHeaderRow, _CharHeaderRow)):
             return Qt.ItemFlag.ItemIsEnabled  # clickable, previews first PAC
         return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
@@ -236,6 +285,9 @@ class SeparatorDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         item = index.model()._rows[index.row()] if index.isValid() else None
 
+        if item is _CHAR_SECTION:
+            self._draw_section(painter, option, "\u25c6  CHARACTERS", "#70b080")
+            return
         if item is _ITEM_SECTION:
             self._draw_section(painter, option, "\u25c6  ITEMS", "#c0a050")
             return
@@ -281,6 +333,29 @@ class SeparatorDelegate(QStyledItemDelegate):
                              Qt.AlignmentFlag.AlignVCenter, item.internal_name)
             painter.restore()
             return
+        if isinstance(item, _CharHeaderRow):
+            painter.save()
+            if option.state & QStyle.StateFlag.State_Selected:
+                painter.fillRect(option.rect, option.palette.highlight())
+            else:
+                painter.fillRect(option.rect, option.palette.base())
+
+            font = QFont(option.font)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor("#90d0a0"))
+            r = option.rect.adjusted(12, 0, 0, 0)
+            painter.drawText(r, Qt.AlignmentFlag.AlignVCenter, item.display_label)
+            fm = painter.fontMetrics()
+            name_w = fm.horizontalAdvance(item.display_label + "  ")
+            font.setBold(False)
+            font.setPointSize(font.pointSize() - 1)
+            painter.setFont(font)
+            painter.setPen(QColor("#808080"))
+            painter.drawText(r.adjusted(name_w, 0, 0, 0),
+                             Qt.AlignmentFlag.AlignVCenter, item.app_name)
+            painter.restore()
+            return
         if isinstance(item, _ItemChildRow):
             painter.save()
             if option.state & QStyle.StateFlag.State_Selected:
@@ -300,13 +375,13 @@ class SeparatorDelegate(QStyledItemDelegate):
 
     def sizeHint(self, option, index):
         item = index.model()._rows[index.row()] if index.isValid() else None
-        if item in (_SEPARATOR_SENTINEL, _ITEM_SECTION, _MODEL_SECTION):
+        if item in (_SEPARATOR_SENTINEL, _ITEM_SECTION, _CHAR_SECTION, _MODEL_SECTION):
             return QSize(option.rect.width(), 24)
         return super().sizeHint(option, index)
 
 
 class CatalogWorker(QThread):
-    catalog_ready = Signal(list, list, object)  # (catalog, all_pamt_entries, item_index)
+    catalog_ready = Signal(list, list, object, object)  # (catalog, entries, item_index, char_index)
     progress = Signal(str)
     failed = Signal(str)
 
@@ -319,6 +394,8 @@ class CatalogWorker(QThread):
             catalog, all_entries = build_catalog(self._game_dir,
                                                  progress_fn=self.progress.emit)
             # Build item index in same thread -- available immediately
+            item_index = None
+            char_index = None
             try:
                 item_index = build_item_index(self._game_dir, all_entries,
                                               progress_fn=self.progress.emit)
@@ -326,7 +403,19 @@ class CatalogWorker(QThread):
                 import traceback
                 traceback.print_exc()
                 self.progress.emit(f"Item index failed: {ei}")
-                item_index = None  # non-fatal -- app works without item search
-            self.catalog_ready.emit(catalog, all_entries, item_index)
+
+            # Build character index using prefab map from item index
+            try:
+                prefab_map = item_index.prefab_pac_map if item_index else {}
+                if not prefab_map:
+                    prefab_map = build_prefab_pac_map(all_entries, self.progress.emit)
+                char_index = build_character_index(all_entries, prefab_map,
+                                                   progress_fn=self.progress.emit)
+            except Exception as ec:
+                import traceback
+                traceback.print_exc()
+                self.progress.emit(f"Character index failed: {ec}")
+
+            self.catalog_ready.emit(catalog, all_entries, item_index, char_index)
         except Exception as e:
             self.failed.emit(str(e))

@@ -63,6 +63,7 @@ class SceneMesh:
 
 _SEPARATOR_SENTINEL = object()  # unique marker for separator rows
 _ITEM_SECTION = object()        # "ITEMS" section header
+_CHAR_SECTION = object()        # "CHARACTERS" section header
 _MODEL_SECTION = object()       # "MODELS" section header
 
 
@@ -79,6 +80,14 @@ class _ItemChildRow:
     """PAC file shown as child of an item header."""
     catalog_entry: CatalogEntry  # the actual model entry
     is_last: bool                # for tree glyph rendering
+
+
+@dataclass
+class _CharHeaderRow:
+    """Character appearance row in search results."""
+    display_label: str   # e.g. "macduff" or "bear"
+    app_name: str        # e.g. "cd_phm_macduff_00000"
+    pac_files: list      # list of pac filename strings
 
 
 def fuzzy_match(query: str, target: str) -> tuple[bool, int]:
