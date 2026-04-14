@@ -1,13 +1,12 @@
-"""Item database: maps in-game item names to model (PAC) files.
+"""Item and character database: maps in-game names to model (PAC) files.
 
-Parses the localization DB and iteminfo.pabgb to build a lookup from
-English display names → internal names → prefab hashes → PAC filenames.
+Parses the localization DB, iteminfo.pabgb, and .app.xml appearance files
+to build lookups from display names → PAC filenames.
 
 Usage:
-    from item_db import build_item_index, ItemRecord
+    from item_db import build_item_index, build_character_index
     index = build_item_index(game_dir, pamt_0009_entries, progress_fn)
-    # index.items: list of ItemRecord with display names + PAC filenames
-    # index.pac_to_items: dict mapping pac_basename → [ItemRecord, ...]
+    char_index = build_character_index(pamt_0009_entries, index.prefab_pac_map, progress_fn)
 """
 
 import os
@@ -37,6 +36,21 @@ class ItemRecord:
 class ItemIndex:
     items: list[ItemRecord]
     pac_to_items: dict[str, list[ItemRecord]]   # pac_basename → items
+    prefab_pac_map: dict = field(default_factory=dict)  # prefab_basename → [pac_basenames]
+
+
+@dataclass
+class CharacterRecord:
+    app_name: str           # e.g. "cd_phm_macduff_00000"
+    display_label: str      # e.g. "macduff" or "bear_00000"
+    search_key: str         # lowercase combined name for search
+    pac_files: list[str] = field(default_factory=list)   # resolved pac filenames
+
+
+@dataclass
+class CharacterIndex:
+    characters: list[CharacterRecord]
+    pac_to_chars: dict[str, list[CharacterRecord]]  # pac_basename → characters
 
 
 # ── Localization DB ───────────────────────────────────────────────
@@ -327,4 +341,141 @@ def build_item_index(game_dir: str, pamt_0009_entries: list,
     if progress_fn:
         progress_fn(f"Items with models: {len(items_with_models):,}")
 
-    return ItemIndex(items=items_with_models, pac_to_items=pac_to_items)
+    return ItemIndex(items=items_with_models, pac_to_items=pac_to_items,
+                     prefab_pac_map=prefab_pac_map)
+
+
+# ── Character index (from .app.xml appearance files) ─────────────
+
+def _parse_app_label(app_name: str) -> str:
+    """Extract readable label from app.xml filename.
+
+    cd_phm_macduff_00000  → macduff
+    cd_m0001_00_bear_00000 → bear
+    cd_r0002_00_horse_00003 → horse (variant 3)
+    """
+    parts = app_name.split('_')
+    # Strip leading cd + type prefix (cd_phm_, cd_m0001_00_, cd_r0002_00_, etc.)
+    # Find the first part that is NOT: 'cd', a type code, or a 2-digit segment
+    name_parts = []
+    skip = True
+    for i, p in enumerate(parts):
+        if skip:
+            if p == 'cd':
+                continue
+            if re.match(r'^(phm|phw|pom|pgm|pgw|ptm|pdm|pdw|ppdm|pow)$', p):
+                continue
+            if re.match(r'^[mrt]\d{4}$', p):
+                continue
+            if re.match(r'^\d{2}$', p) and i < 4:
+                continue
+            skip = False
+        if not skip:
+            name_parts.append(p)
+
+    if not name_parts:
+        return app_name
+
+    # Last part is usually the variant number (00000, 00001, etc.)
+    variant = name_parts[-1] if re.match(r'^\d{5}$', name_parts[-1]) else None
+    core = '_'.join(name_parts[:-1]) if variant else '_'.join(name_parts)
+
+    if not core:
+        return app_name
+
+    if variant and variant != '00000':
+        return f"{core} (variant {int(variant)})"
+    return core
+
+
+def build_character_index(pamt_entries: list, prefab_pac_map: dict,
+                          progress_fn=None) -> CharacterIndex:
+    """Parse .app.xml files and resolve prefab names to PAC files.
+
+    Returns CharacterIndex with all appearance entries that have at least
+    one resolved PAC model file.
+    """
+    import xml.etree.ElementTree as ET
+
+    if progress_fn:
+        progress_fn("Loading character appearances...")
+
+    app_entries = [e for e in pamt_entries
+                   if e.path.endswith('.app.xml')]
+
+    if not app_entries:
+        return CharacterIndex(characters=[], pac_to_chars={})
+
+    # Group by PAZ file for sequential I/O
+    by_paz: dict[str, list] = {}
+    for e in app_entries:
+        by_paz.setdefault(e.paz_file, []).append(e)
+
+    characters = []
+    pac_to_chars: dict[str, list[CharacterRecord]] = {}
+
+    for paz_file, paz_entries in by_paz.items():
+        with open(paz_file, 'rb') as f:
+            for e in paz_entries:
+                f.seek(e.offset)
+                raw = f.read(e.orig_size)
+                xml_data = decrypt(raw, e.path)
+                try:
+                    root = ET.fromstring(xml_data)
+                except Exception:
+                    continue
+
+                app_name = os.path.splitext(os.path.basename(e.path))[0]
+                # Remove .app suffix if present (filename is X.app.xml)
+                if app_name.endswith('.app'):
+                    app_name = app_name[:-4]
+
+                pac_files = []
+                for prefab_el in root.findall('.//Prefab'):
+                    name = prefab_el.get('Name', '')
+                    if not name:
+                        continue
+                    pac_bases = prefab_pac_map.get(name.lower())
+                    if pac_bases:
+                        for pb in pac_bases:
+                            pac_name = pb + '.pac'
+                            if pac_name not in pac_files:
+                                pac_files.append(pac_name)
+
+                if not pac_files:
+                    continue
+
+                label = _parse_app_label(app_name)
+
+                # Extract display name from meshparam or voice event
+                extra_names = []
+                cust = root.find('Customization')
+                if cust is not None:
+                    mpf = cust.get('MeshParamFile', '')
+                    m = re.match(r'meshparam_example_(\w+)\.xml', mpf)
+                    if m:
+                        extra_names.append(m.group(1))
+                for se in root.findall('.//SoundEvent'):
+                    vname = se.get('Name', '')
+                    if vname.startswith('vce_pc_'):
+                        extra_names.append(vname[7:])  # strip "vce_pc_"
+
+                search_key = f"{app_name} {label} {' '.join(extra_names)}".lower()
+
+                rec = CharacterRecord(
+                    app_name=app_name,
+                    display_label=label,
+                    search_key=search_key,
+                    pac_files=pac_files,
+                )
+                characters.append(rec)
+                for pac_name in pac_files:
+                    pac_to_chars.setdefault(pac_name, []).append(rec)
+
+    characters.sort(key=lambda c: c.app_name)
+
+    if progress_fn:
+        progress_fn(f"Characters: {len(characters):,} appearances, "
+                    f"{len(pac_to_chars):,} PAC files")
+
+    return CharacterIndex(characters=characters, pac_to_chars=pac_to_chars)
